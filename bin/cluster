@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""cluster: run one GGUF model across every awake device.
+
+  cluster nodes                       who is awake, what they offer
+  cluster run MODEL.gguf [options]    plan the split, start llama-server
+  cluster plan MODEL.gguf [options]   same, print the plan only
+  cluster status                      current run + throughput
+  cluster stop                        stop llama-server
+  cluster logs [-f]                   llama-server log
+
+run/plan options:
+  --ctx N            context size (default 8192)
+  --port N           llama-server port (default LLAMA_PORT, 8080)
+  --only a,b         use only these nodes      --exclude a,b   skip these nodes
+  --no-head-gpu      leave the head's GPU out  --cpu-only      only CPU workers
+  --margin PCT       keep this much of each device's memory free (default 12)
+  --wifi             allow Wi-Fi devices (default: only if needed to fit)
+  --                 everything after is passed to llama-server
+
+How the split works: llama.cpp's RPC backend splits the model by layers across
+devices, in the order given. Every token walks through every device, so the
+planner fills the fastest devices first (head GPU, wired GPU, wired CPU, Wi-Fi)
+and only reaches for the slow ones when the model does not fit otherwise.
+Layers that fit nowhere stay on the head's CPU RAM.
+"""
+import json
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+import time
+import urllib.request
+
+ENV_FILE = os.environ.get("CLUSTER_ENV", "/etc/home-cluster/head.env")
+
+
+def read_env(path):
+    env = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return env
+
+
+ENV = read_env(ENV_FILE)
+cfg = lambda k, d=None: os.environ.get(k) or ENV.get(k) or d
+ROOT = cfg("CLUSTER_ROOT", "/srv/cluster")
+STATE = cfg("STATE_DIR", os.path.join(ROOT, "state"))
+LOGS = cfg("LOG_DIR", os.path.join(ROOT, "logs"))
+MODELS = cfg("MODELS_DIR", os.path.join(ROOT, "models"))
+LLAMA_BIN = cfg("LLAMA_BIN", "/opt/llama.cpp/bin")
+CLUSTERD = "http://127.0.0.1:%s" % cfg("CLUSTERD_PORT", "8787")
+RUN_FILE = os.path.join(STATE, "run.json")
+LOG_FILE = os.path.join(LOGS, "llama-server.log")
+
+C = {"b": "\033[1m", "g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "d": "\033[2m", "0": "\033[0m"}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+
+def die(msg):
+    print(C["r"] + "error: " + C["0"] + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def gb(mb):
+    return "%.1f GB" % (mb / 1024) if mb is not None else "-"
+
+
+def get_json(url, timeout=3):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+# ---------------------------------------------------------------------------
+# GGUF header: enough metadata to plan the split
+# ---------------------------------------------------------------------------
+def read_gguf(path):
+    """Return dict with arch, name, n_layer, n_embd, n_head, n_head_kv, size_mb."""
+    types = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    meta = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            die("%s is not a GGUF file" % path)
+        version, = struct.unpack("<I", f.read(4))
+        if version < 2:
+            die("GGUF v%d is too old" % version)
+        n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+
+        def rstr():
+            n, = struct.unpack("<Q", f.read(8))
+            return f.read(n).decode("utf-8", "replace")
+
+        def rval(t):
+            if t == 8:
+                return rstr()
+            if t == 9:
+                et, = struct.unpack("<I", f.read(4))
+                n, = struct.unpack("<Q", f.read(8))
+                if et in types:
+                    sz = struct.calcsize(types[et])
+                    f.seek(n * sz, 1)
+                    return None
+                for _ in range(n):
+                    rval(et)
+                return None
+            fmt = types[t]
+            return struct.unpack("<" + fmt, f.read(struct.calcsize(fmt)))[0]
+
+        for _ in range(n_kv):
+            key = rstr()
+            t, = struct.unpack("<I", f.read(4))
+            if key.startswith("tokenizer."):
+                break  # everything we need comes before the tokenizer
+            meta[key] = rval(t)
+    arch = meta.get("general.architecture", "llama")
+    g = lambda k, d=None: meta.get("%s.%s" % (arch, k), d)
+    n_head = g("attention.head_count", 32) or 32
+    return {
+        "arch": arch,
+        "name": meta.get("general.name") or os.path.basename(path),
+        "n_layer": int(g("block_count", 0) or 0),
+        "n_embd": int(g("embedding_length", 4096) or 4096),
+        "n_head": int(n_head),
+        "n_head_kv": int(g("attention.head_count_kv", n_head) or n_head),
+        "size_mb": os.path.getsize(path) // 2**20,
+        "n_tensors": n_tensors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# devices
+# ---------------------------------------------------------------------------
+def head_devices():
+    """Local (non-RPC) devices llama.cpp sees on the head, from --list-devices."""
+    exe = os.path.join(LLAMA_BIN, "llama-server")
+    try:
+        out = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, timeout=20)
+        text = out.stdout + out.stderr
+    except (OSError, subprocess.SubprocessError):
+        return []
+    devs = []
+    for m in re.finditer(r"^\s+(\S+):\s+(.*?)\s+\((\d+)\s+MiB,\s+(\d+)\s+MiB free\)", text, re.M):
+        name, desc, total, free = m.groups()
+        if name.upper().startswith("CPU"):
+            continue
+        devs.append({"device": name, "node": cfg("NODE_NAME", "head"), "desc": desc, "link": "local",
+                     "gpu": name.rstrip("0123456789").lower(), "offered_mb": int(free), "total_mb": int(total)})
+    return devs
+
+
+def offered_mb(n):
+    g = n.get("gpu") or {}
+    if g.get("vram_free_mb") is not None and not g.get("unified"):
+        return int(g["vram_free_mb"])
+    free = int((n.get("mem") or {}).get("free_mb") or 0)
+    cap = int((n.get("rpc") or {}).get("mem_mb") or 0)
+    return min(free, cap) if cap else free
+
+
+def fresh(n):
+    """Re-poll a node's agent so we plan on current free memory, not a 10 s old heartbeat."""
+    try:
+        m = get_json("http://%s:%s/metrics" % (n.get("lan_ip"), n.get("agent_port", 8788)), timeout=2)
+        if m.get("name") != n.get("name"):
+            return n          # someone else answered on that address; trust the heartbeat
+        m["awake"] = True
+        return m
+    except Exception:
+        return n
+
+
+def worker_devices(only=None, exclude=None, wifi=True, cpu_only=False):
+    try:
+        nodes = get_json(CLUSTERD + "/api/nodes")
+    except Exception as e:
+        die("clusterd not reachable at %s (%s). Is clusterd.service running on the head?" % (CLUSTERD, e))
+    devs = []
+    for n in nodes:
+        if n.get("role") == "head" or not n.get("awake"):
+            continue
+        if only and n["name"] not in only:
+            continue
+        if exclude and n["name"] in exclude:
+            continue
+        n = fresh(n)
+        if not (n.get("rpc") or {}).get("listening"):
+            continue
+        gpu = (n.get("gpu") or {}).get("kind", "cpu")
+        if cpu_only and gpu != "cpu":
+            continue
+        devs.append({"device": "RPC[%s:%s]" % (n["lan_ip"], n["rpc"]["port"]), "node": n["name"],
+                     "link": n.get("link", "unknown"), "gpu": gpu, "offered_mb": offered_mb(n),
+                     "temp_c": n.get("temp_c"), "rpc": "%s:%s" % (n["lan_ip"], n["rpc"]["port"])})
+    rank = {"wired": 0, "unknown": 1, "wifi": 2}
+    devs.sort(key=lambda d: (rank.get(d["link"], 1), d["gpu"] == "cpu", -d["offered_mb"]))
+    return devs
+
+
+# ---------------------------------------------------------------------------
+# planner
+# ---------------------------------------------------------------------------
+def plan(model_path, ctx=8192, margin=12, only=None, exclude=None, head_gpu=True, cpu_only=False, wifi=None):
+    info = read_gguf(model_path)
+    if not info["n_layer"]:
+        die("could not read block_count from %s" % model_path)
+    head_dim = info["n_embd"] // max(info["n_head"], 1)
+    kv_mb = 2 * info["n_head_kv"] * head_dim * 2 * ctx * info["n_layer"] / 2**20  # f16 K and V
+    per_layer = (info["size_mb"] + kv_mb) / info["n_layer"] * 1.08                # + compute buffers
+    need_mb = per_layer * info["n_layer"]
+
+    devs = (head_devices() if head_gpu and not cpu_only else []) + \
+           worker_devices(only, exclude, cpu_only=cpu_only)
+    wired = [d for d in devs if d["link"] != "wifi"]
+    wifi_devs = [d for d in devs if d["link"] == "wifi"]
+    cap = lambda d: int(d["offered_mb"] * (1 - margin / 100) // per_layer)
+    order = wired
+    if wifi or sum(cap(d) for d in wired) < info["n_layer"]:
+        order = wired + wifi_devs    # reach for Wi-Fi only when needed, or asked
+    assigned, start = [], 0
+    for d in order:
+        n = min(cap(d), info["n_layer"] - start)
+        if n <= 0:
+            continue
+        assigned.append({**d, "layers": [start, start + n], "split": n})
+        start += n
+        if start >= info["n_layer"]:
+            break
+    ngl = start
+    left = info["n_layer"] - ngl
+    head_free = None
+    try:
+        hm = get_json("http://127.0.0.1:%s/metrics" % cfg("AGENT_PORT", "8788"), timeout=2)
+        head_free = hm["mem"]["free_mb"]
+    except Exception:
+        try:
+            with open("/proc/meminfo") as f:
+                head_free = int([l for l in f if l.startswith("MemAvailable")][0].split()[1]) // 1024
+        except Exception:
+            pass
+    fits = True
+    if left:
+        need_head = left * per_layer
+        fits = head_free is None or need_head < head_free * (1 - margin / 100)
+        assigned.append({"device": "CPU", "node": cfg("NODE_NAME", "head"), "link": "local", "gpu": "cpu",
+                         "offered_mb": head_free, "layers": [ngl, info["n_layer"]], "split": None})
+    return {
+        "model": info["name"], "model_path": os.path.abspath(model_path), "arch": info["arch"],
+        "size_mb": info["size_mb"], "n_layer": info["n_layer"], "ctx": ctx, "kv_mb": int(kv_mb),
+        "per_layer_mb": int(per_layer), "need_mb": int(need_mb), "ngl": ngl, "fits": fits,
+        "devices": assigned, "margin": margin,
+        "unused": [d["node"] for d in devs if d["node"] not in {a["node"] for a in assigned}],
+    }
+
+
+def print_plan(p):
+    print(C["b"] + p["model"] + C["0"] + "  %s on disk · %d layers · ctx %d · ~%s KV cache · ~%s per layer"
+          % (gb(p["size_mb"]), p["n_layer"], p["ctx"], gb(p["kv_mb"]), gb(p["per_layer_mb"])))
+    print("  %-22s %-8s %-6s %-10s %-8s %s" % ("device", "link", "gpu", "offers", "layers", "range"))
+    for d in p["devices"]:
+        n = d["layers"][1] - d["layers"][0]
+        print("  %-22s %-8s %-6s %-10s %-8d %d-%d" % (d["node"], d["link"], d["gpu"], gb(d["offered_mb"]), n,
+                                                     d["layers"][0], d["layers"][1] - 1))
+    if p["unused"]:
+        print(C["d"] + "  not needed: " + ", ".join(p["unused"]) + C["0"])
+    if p["ngl"] < p["n_layer"]:
+        print(C["y"] + "  %d layer(s) stay on the head's CPU RAM" % (p["n_layer"] - p["ngl"]) + C["0"])
+    if not p["fits"]:
+        print(C["r"] + "  does not fit: need ~%s, wake more devices or pick a smaller quant" % gb(p["need_mb"]) + C["0"])
+
+
+def build_cmd(p, port, extra):
+    rpc = [d for d in p["devices"] if d["device"].startswith("RPC[")]
+    devs = [d["device"] for d in p["devices"] if d["device"] != "CPU"]
+    cmd = [os.path.join(LLAMA_BIN, "llama-server"), "-m", p["model_path"], "--host", "0.0.0.0", "--port", str(port),
+           "--metrics", "-c", str(p["ctx"]), "-ngl", str(p["ngl"]), "--alias", p["model"]]
+    if rpc:
+        cmd += ["--rpc", ",".join(d["rpc"] for d in rpc)]
+    if devs:
+        cmd += ["--device", ",".join(devs)]
+    if len(devs) > 1:
+        cmd += ["--tensor-split", ",".join(str(d["split"]) for d in p["devices"] if d["device"] != "CPU")]
+    return cmd + list(extra)
+
+
+# ---------------------------------------------------------------------------
+# run lifecycle
+# ---------------------------------------------------------------------------
+def save_run(run):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = RUN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(run, f, indent=1)
+    os.replace(tmp, RUN_FILE)
+
+
+def load_run():
+    try:
+        with open(RUN_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def cmd_run(args, dry=False):
+    opts = {"ctx": 8192, "port": int(cfg("LLAMA_PORT", "8080")), "only": None, "exclude": None,
+            "head_gpu": True, "cpu_only": False, "margin": 12, "wifi": None}
+    extra, model = [], None
+    it = iter(args)
+    for a in it:
+        if a == "--":
+            extra = list(it)
+        elif a == "--ctx":
+            opts["ctx"] = int(next(it))
+        elif a == "--port":
+            opts["port"] = int(next(it))
+        elif a == "--only":
+            opts["only"] = set(next(it).split(","))
+        elif a == "--exclude":
+            opts["exclude"] = set(next(it).split(","))
+        elif a == "--margin":
+            opts["margin"] = float(next(it))
+        elif a == "--no-head-gpu":
+            opts["head_gpu"] = False
+        elif a == "--cpu-only":
+            opts["cpu_only"] = True
+        elif a == "--wifi":
+            opts["wifi"] = True
+        elif a.startswith("-"):
+            die("unknown option %s" % a)
+        else:
+            model = a
+    if not model:
+        die("usage: cluster run MODEL.gguf [options]")
+    if not os.path.exists(model) and os.path.exists(os.path.join(MODELS, model)):
+        model = os.path.join(MODELS, model)
+    if not os.path.exists(model):
+        die("%s not found (looked in %s too)" % (model, MODELS))
+    p = plan(model, opts["ctx"], opts["margin"], opts["only"], opts["exclude"], opts["head_gpu"], opts["cpu_only"], opts["wifi"])
+    print_plan(p)
+    cmd = build_cmd(p, opts["port"], extra)
+    print(C["d"] + "  " + " ".join(cmd) + C["0"])
+    if dry:
+        return
+    if not p["fits"]:
+        die("refusing to start, the model does not fit")
+    old = load_run()
+    if old and old.get("pid") and alive(old["pid"]):
+        die("a run is already active (pid %d): cluster stop first" % old["pid"])
+    os.makedirs(LOGS, exist_ok=True)
+    log = open(LOG_FILE, "wb")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    run = {**p, "pid": proc.pid, "port": opts["port"], "cmd": cmd, "started": time.time(), "status": "loading",
+           "log": LOG_FILE}
+    save_run(run)
+    print("loading (pid %d), log: %s" % (proc.pid, LOG_FILE))
+    url = "http://127.0.0.1:%d" % opts["port"]
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            run["status"] = "failed"
+            save_run(run)
+            print(open(LOG_FILE, errors="replace").read()[-3000:])
+            die("llama-server exited with %d" % proc.returncode)
+        try:
+            urllib.request.urlopen(url + "/health", timeout=1).read()
+            break
+        except Exception:
+            time.sleep(1)
+    else:
+        die("timed out waiting for llama-server; see %s" % LOG_FILE)
+    # what llama.cpp actually placed where
+    text = open(LOG_FILE, errors="replace").read()
+    for d in run["devices"]:
+        m = re.search(r"load_tensors:\s+%s model buffer size\s*=\s*([\d.]+) MiB" % re.escape(d["device"]), text)
+        if m:
+            d["buffer_mb"] = int(float(m.group(1)))
+    m = re.search(r"offloaded (\d+)/(\d+) layers", text)
+    if m:
+        run["offloaded"] = [int(m.group(1)), int(m.group(2))]
+    run["status"] = "running"
+    save_run(run)
+    print(C["g"] + "running" + C["0"] + "  http://%s:%d  (OpenAI-compatible: /v1/chat/completions)" % (cfg("HEAD", "head"), opts["port"]))
+    print('  curl http://%s:%d/v1/chat/completions -d \'{"messages":[{"role":"user","content":"hi"}]}\'' % (cfg("HEAD", "head"), opts["port"]))
+
+
+def cmd_stop():
+    run = load_run()
+    if not run or not run.get("pid"):
+        print("nothing running")
+        return
+    pid = run["pid"]
+    if alive(pid):
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        for _ in range(30):
+            if not alive(pid):
+                break
+            time.sleep(0.5)
+        else:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    run["status"] = "stopped"
+    run["stopped"] = time.time()
+    save_run(run)
+    print("stopped")
+
+
+def cmd_status():
+    run = load_run()
+    if run:
+        print("%s  status=%s  pid=%s  port=%s" % (run["model"], run.get("status"), run.get("pid"), run.get("port")))
+        print_plan(run)
+    else:
+        print("no run")
+    try:
+        st = get_json(CLUSTERD + "/api/state")
+        if st.get("llama"):
+            l = st["llama"]
+            print("throughput: %.1f tok/s generation, %.0f tok/s prompt" % (l.get("gen_tps") or 0, l.get("prompt_tps") or 0))
+    except Exception:
+        pass
+
+
+def cmd_nodes():
+    try:
+        nodes = get_json(CLUSTERD + "/api/nodes")
+    except Exception as e:
+        die("clusterd not reachable (%s)" % e)
+    print("  %-18s %-7s %-6s %-6s %-7s %-10s %-10s %-6s %s" % ("node", "role", "state", "link", "gpu", "free ram", "offers", "temp", "rpc"))
+    for n in nodes:
+        g = n.get("gpu") or {}
+        print("  %-18s %-7s %-6s %-6s %-7s %-10s %-10s %-6s %s" % (
+            n["name"], n.get("role"), "awake" if n.get("awake") else "asleep", n.get("link"), g.get("kind", "cpu"),
+            gb((n.get("mem") or {}).get("free_mb")), gb(offered_mb(n)),
+            "%s°C" % n["temp_c"] if n.get("temp_c") is not None else "-",
+            "local" if n.get("role") == "head" else ("up" if (n.get("rpc") or {}).get("listening") else "down")))
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "nodes":
+        cmd_nodes()
+    elif cmd == "run":
+        cmd_run(args)
+    elif cmd == "plan":
+        cmd_run(args, dry=True)
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "logs":
+        os.execvp("tail", ["tail", "-n", "100"] + (["-f"] if "-f" in args else []) + [LOG_FILE])
+    else:
+        die("unknown command %s (see --help)" % cmd)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
