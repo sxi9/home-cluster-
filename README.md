@@ -14,7 +14,7 @@ language model can run across all of them, with k3s for grouped services.
 - **Head owns all shared state**: model files, the k3s join token, an NFS
   export at `/srv/cluster`. Workers hold only a token and a service unit, so a
   wiped device rejoins in minutes.
-- **Networking**: wired LAN carries per-token model traffic; Tailscale on every
+- **Networking**: wired LAN carries per-token model traffic, Wi-Fi is accepted as a slower fallback; Tailscale on every
   device for stable names, SSH and off-home access. Static DHCP leases.
 - **Orchestration**: k3s, head as server, every worker as an agent.
 - **Model splitting**: llama.cpp built with `GGML_RPC=ON`. `rpc-server` on each

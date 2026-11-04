@@ -6,7 +6,7 @@
 # after a wipe, a config change, or to pick up a new llama.cpp build.
 #
 # What it does, in order:
-#   1. preflight   root check, Ubuntu/Debian, arch, hostname, wired LAN iface
+#   1. preflight   root check, Ubuntu/Debian, arch, hostname, LAN iface (wired > Wi-Fi)
 #   2. packages    curl git cmake build tools nfs-common openssh-server
 #   3. tailscale   install + `tailscale up --ssh` (skippable)
 #   4. nfs         automount head:/srv/cluster at /mnt/cluster (nofail)
@@ -109,7 +109,7 @@ Options:
   --head HOST            LAN IP/name of the head node (required on first run)
   --head-ssh HOST        name used to ssh to the head (default: --head)
   --name NAME            set this machine's hostname / k3s node name
-  --lan-iface IFACE      wired interface for model + k3s traffic (auto)
+  --lan-iface IFACE      interface for model + k3s traffic (auto: wired, else Wi-Fi)
   --token TOKEN          k3s join token (or env CLUSTER_TOKEN)
   --token-file PATH      read the join token from a file
   --rpc-port N           rpc-server port (default $RPC_PORT)
@@ -199,7 +199,7 @@ preflight() {
   cat <<INFO
     node name   : $NODE_NAME ($ARCH, ${MEM_TOTAL_MB} MB RAM, $(nproc) cpus)
     head        : $HEAD (ssh via $HEAD_SSH)
-    lan         : $LAN_IFACE $LAN_IP
+    lan         : $LAN_IFACE $LAN_IP ($LINK_TYPE)
     rpc-server  : $LAN_IP:$RPC_PORT, ${RPC_MEM_MB} MB offered, $RPC_THREADS threads
     llama.cpp   : $LLAMA_REF
     k3s         : ${K3S_VERSION:-installer default}
@@ -238,10 +238,14 @@ detect_lan() {
     done < <(ip -o -4 route show default | awk '{print $5}')
   fi
   [[ -n $LAN_IFACE ]] || die "no default-route interface found; pass --lan-iface"
-  case $LAN_IFACE in
-    en*|eth*) ;;
-    *) warn "$LAN_IFACE does not look wired; model traffic will be slow over wifi" ;;
-  esac
+  # Wired is preferred for per-token traffic; Wi-Fi is accepted as a fallback.
+  # The link type is saved and labelled so `cluster run` can order devices by it.
+  if [[ -d /sys/class/net/$LAN_IFACE/wireless ]] || [[ $LAN_IFACE == wl* ]]; then
+    LINK_TYPE=wifi
+    warn "$LAN_IFACE is Wi-Fi: this worker will work, but it caps the cluster's tokens/sec"
+  else
+    LINK_TYPE=wired
+  fi
   LAN_IP=$(ip -o -4 addr show dev "$LAN_IFACE" | awk '{print $4}' | cut -d/ -f1 | head -n1)
   [[ -n $LAN_IP ]] || die "no IPv4 address on $LAN_IFACE (cable moved? pass --lan-iface)"
   LAN_CIDR=$(ip -o -4 addr show dev "$LAN_IFACE" | awk '{print $4}' | head -n1)
@@ -376,6 +380,7 @@ HEAD_SSH=$HEAD_SSH
 NODE_NAME=$NODE_NAME
 LAN_IFACE=$LAN_IFACE
 LAN_IP=$LAN_IP
+LINK_TYPE=$LINK_TYPE
 RPC_PORT=$RPC_PORT
 RPC_RESERVE_MB=$RPC_RESERVE_MB
 RPC_MEM_MB=$RPC_MEM_MB
@@ -469,6 +474,7 @@ join_k3s() {
     --flannel-iface "$LAN_IFACE"
     --node-label "home-cluster/role=worker"
     --node-label "home-cluster/arch=$ARCH"
+    --node-label "home-cluster/link=$LINK_TYPE"
     --node-label "home-cluster/ram-mb=$MEM_TOTAL_MB"
     --node-label "home-cluster/rpc-port=$RPC_PORT")
   if (( DRY_RUN )); then
@@ -559,7 +565,7 @@ load_saved() {
   log "loading saved settings from $ENV_FILE (flags override)"
   # shellcheck disable=SC1090
   . <(grep -E '^[A-Z_]+=' "$ENV_FILE")
-  LAN_IP="" RPC_MEM_MB=""   # always recomputed
+  LAN_IP="" LINK_TYPE="" RPC_MEM_MB=""   # always recomputed
 }
 
 main() {
