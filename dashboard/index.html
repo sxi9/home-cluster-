@@ -213,7 +213,7 @@ footer { color:var(--text-3); font-size:12px; margin-top:20px; }
       $('r-model').textContent = run.model || '';
       $('r-meta').textContent = [run.size_mb ? gb(run.size_mb) + ' GB on disk' : null, run.n_layer ? run.n_layer + ' layers' : null,
         run.ngl != null && run.n_layer && run.ngl < run.n_layer ? (run.n_layer - run.ngl) + ' kept on head CPU' : null,
-        run.ctx ? 'ctx ' + run.ctx : null, run.status, run.started ? 'started ' + new Date(run.started * 1000).toLocaleTimeString() : null].filter(Boolean).join(' · ');
+        run.ctx ? 'ctx ' + run.ctx : null, run.draft ? 'draft: ' + run.draft : null, run.status, run.started ? 'started ' + new Date(run.started * 1000).toLocaleTimeString() : null].filter(Boolean).join(' · ');
       const total = run.devices.reduce((a, d) => a + (d.layers ? d.layers[1] - d.layers[0] : 0), 0) || 1;
       $('r-layers').innerHTML = run.devices.map((d, i) => {
         const n = d.layers ? d.layers[1] - d.layers[0] : 0;

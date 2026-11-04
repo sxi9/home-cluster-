@@ -292,6 +292,23 @@ BOOT
   termux-wake-lock 2>/dev/null || true
 }
 
+# ssh into the phone from the head: Termux sshd on 8022, any username, key only
+setup_ssh() {
+  log "sshd on port 8022 for the head's controller key"
+  local pub; pub=$(curl -fsS --max-time 5 "$JOIN_URL/head.pub" 2>/dev/null || true)
+  if [[ $pub == ssh-* ]]; then
+    if (( DRY_RUN )); then printf '    + append to ~/.ssh/authorized_keys: %s ...\n' "${pub%% *}"
+    else
+      mkdir -p "$HOME/.ssh"; chmod 0700 "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; chmod 0600 "$HOME/.ssh/authorized_keys"
+      grep -qF "$pub" "$HOME/.ssh/authorized_keys" || printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
+    fi
+  else
+    warn "head.pub not published; 'cluster exec' will not reach this phone until android.sh is re-run"
+  fi
+  if (( DRY_RUN )); then run sv-enable sshd; else sv-enable sshd 2>/dev/null || true; fi
+  return 0
+}
+
 root_tweaks() {
   (( HAS_ROOT )) || return 0
   log "root: keep Termux alive, keep Wi-Fi on, protect rpc-server from the low-memory killer"
@@ -371,6 +388,7 @@ main() {
   install_agent
   write_env
   install_services
+  setup_ssh
   root_tweaks
   setup_chroot
   summary

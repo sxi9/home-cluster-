@@ -608,6 +608,24 @@ UNIT
   run systemctl restart cluster-agent.service
 }
 
+# authorise the head's controller key, so `cluster exec` on the head can fix
+# this worker over ssh (LAN or Tailscale) without passwords
+authorize_head() {
+  [[ -n $JOIN_URL ]] || return 0
+  local pub; pub=$(curl -fsS --max-time 5 "$JOIN_URL/head.pub" 2>/dev/null || true)
+  [[ $pub == ssh-* ]] || return 0
+  log "ssh: authorising the head's key for root"
+  (( DRY_RUN )) && { printf '    + append to /root/.ssh/authorized_keys: %s\n' "${pub%% *} ..."; return 0; }
+  install -d -m 0700 /root/.ssh
+  touch /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys
+  grep -qF "$pub" /root/.ssh/authorized_keys || printf '%s\n' "$pub" >> /root/.ssh/authorized_keys
+  # sshd: keys only for root
+  if ! grep -qs '^PermitRootLogin prohibit-password' /etc/ssh/sshd_config.d/home-cluster.conf 2>/dev/null; then
+    printf 'PermitRootLogin prohibit-password\n' > /etc/ssh/sshd_config.d/home-cluster.conf
+    (( HAS_SYSTEMD )) && systemctl reload ssh 2>/dev/null || true
+  fi
+}
+
 # ----------------------------------------------------------------------------
 # 8. k3s agent
 # ----------------------------------------------------------------------------
@@ -761,6 +779,7 @@ main() {
   write_env
   install_rpc_service
   install_agent
+  authorize_head
   join_k3s
   configure_firewall
   keep_awake

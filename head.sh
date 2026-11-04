@@ -53,6 +53,7 @@ LAN_IFACE=""
 GPU="${GPU:-auto}"
 GPU_NAME=""
 LLAMA_REF="master"      # resolved to a commit and pinned for every worker
+LLAMA_TAG=""            # release tag of that commit (bNNNN), for Windows prebuilts
 K3S_VERSION=""
 TS_AUTHKEY="${TS_AUTHKEY:-}"
 HEAD_SSH=""             # Tailscale name workers ssh to; defaults to the hostname
@@ -254,6 +255,9 @@ build_llama() {
   [[ $LLAMA_REF == master ]] && run git -C "$SRC_DIR" pull --quiet --ff-only
   # Pin to the exact commit: workers must build the same one (RPC protocol).
   LLAMA_REF=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo "$LLAMA_REF")
+  # the release tag of that commit, so Windows workers can fetch the matching prebuilt
+  LLAMA_TAG=$(git -C "$SRC_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)
+  [[ -n $LLAMA_TAG ]] || warn "commit $LLAMA_REF has no release tag; Windows workers will take the latest release (RPC may mismatch). Prefer --llama-ref bNNNN"
   if [[ -x $INSTALL_DIR/bin/llama-server && $(cat "$INSTALL_DIR/BUILT_REF" 2>/dev/null) == "$LLAMA_REF:$GPU" ]]; then
     log "already built $LLAMA_REF for $GPU"; return
   fi
@@ -293,6 +297,8 @@ install_app() {
   run install -m 0644 "$REPO_DIR/dashboard/index.html" "$APP_DIR/index.html"
   run install -m 0755 "$REPO_DIR/agent/cluster-agent.py" "$APP_DIR/cluster-agent.py"
   run install -m 0755 "$REPO_DIR/bin/cluster" /usr/local/bin/cluster
+  run install -d -m 0755 "$APP_DIR/k8s"
+  run install -m 0644 "$REPO_DIR"/k8s/*.yaml "$APP_DIR/k8s/"
   write_file "$ENV_FILE" 0644 <<ENV
 # home-cluster head settings — written by head.sh
 NODE_NAME=$NODE_NAME
@@ -319,6 +325,8 @@ RPC_PORT=$RPC_PORT
 CLUSTERD_PORT=$CLUSTERD_PORT
 AGENT_PORT=$AGENT_PORT
 DASHBOARD_HTML=$APP_DIR/index.html
+K8S_DIR=$APP_DIR/k8s
+SSH_KEY=$CONF_DIR/id_ed25519
 ENV
   write_file /etc/systemd/system/clusterd.service 0644 <<UNIT
 [Unit]
@@ -376,6 +384,12 @@ UNIT
 
 publish_join() {
   log "publishing join files to $JOIN_DIR"
+  # the head's controller key: workers authorise it so `cluster exec` reaches them
+  if [[ ! -s $CONF_DIR/id_ed25519 ]]; then
+    run install -d -m 0700 "$CONF_DIR"
+    run ssh-keygen -q -t ed25519 -N "" -C "home-cluster-head" -f "$CONF_DIR/id_ed25519"
+  fi
+  [[ -s $CONF_DIR/id_ed25519.pub ]] && run install -m 0644 -o "$SERVICE_USER" "$CONF_DIR/id_ed25519.pub" "$JOIN_DIR/head.pub"
   write_file "$JOIN_DIR/cluster.env" 0644 "$SERVICE_USER:$SERVICE_USER" <<ENV
 # published by head.sh — workers take these pins; flags on worker.sh still win
 HEAD=$LAN_IP
@@ -383,10 +397,11 @@ HEAD_SSH=$HEAD_SSH
 JOIN_URL=http://$LAN_IP:$CLUSTERD_PORT
 RPC_PORT=$RPC_PORT
 LLAMA_REF=$LLAMA_REF
+LLAMA_TAG=${LLAMA_TAG:-}
 K3S_VERSION=$K3S_VERSION
 ENV
   run cp -f "$JOIN_DIR/cluster.env" "$ROOT/cluster.env"
-  local f; for f in worker.sh android.sh join.sh; do
+  local f; for f in worker.sh android.sh join.sh worker.ps1; do
     [[ -r $REPO_DIR/$f ]] && run install -m 0644 -o "$SERVICE_USER" "$REPO_DIR/$f" "$JOIN_DIR/$f"
   done
   run install -m 0644 -o "$SERVICE_USER" "$REPO_DIR/agent/cluster-agent.py" "$JOIN_DIR/cluster-agent.py"
@@ -433,10 +448,17 @@ summary() {
   Join a rooted Android phone (in Termux):
       curl -fsSL http://$LAN_IP:$CLUSTERD_PORT/android.sh | bash
 
+  Join a Windows PC natively (model pool only, elevated PowerShell):
+      powershell -ExecutionPolicy Bypass -c "iwr -useb http://$LAN_IP:$CLUSTERD_PORT/worker.ps1 -OutFile \$env:TEMP\worker.ps1; & \$env:TEMP\worker.ps1"
+
   Then, on the head:
       cluster nodes                              # who is awake
       cp model.gguf $MODELS_DIR/
       cluster run model.gguf                     # split across awake devices
+      cluster run model.gguf --draft small.gguf  # faster: speculative decoding
+      cluster ui                                 # Open WebUI at http://$LAN_IP:30080
+      cluster exec --all -- uptime               # one controller for every device
+      cluster restart --all                      # restart rpc-server + agent everywhere
       kubectl get nodes -o wide                  # k3s view
 
   Pins published for workers: llama.cpp $LLAMA_REF, k3s ${K3S_VERSION:-unpinned}

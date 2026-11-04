@@ -7,6 +7,12 @@
   cluster status                      current run + throughput
   cluster stop                        stop llama-server
   cluster logs [-f]                   llama-server log
+  cluster ui [stop]                   Open WebUI on k3s, pointed at this cluster
+  cluster models                      GGUFs in the share, with size and fit
+  cluster exec NODE|--all -- CMD      run a command on devices over ssh (one controller)
+  cluster restart [NODE|--all]        restart rpc-server + agent on devices
+  cluster ssh NODE                    interactive shell on a device
+  cluster share [--public|off]        dashboard + Open WebUI over Tailscale (or the internet)
 
 run/plan options:
   --ctx N            context size (default 8192)
@@ -15,6 +21,9 @@ run/plan options:
   --no-head-gpu      leave the head's GPU out  --cpu-only      only CPU workers
   --margin PCT       keep this much of each device's memory free (default 12)
   --wifi             allow Wi-Fi devices (default: only if needed to fit)
+  --draft SMALL.gguf speculative decoding: a small draft model on the head
+                     proposes tokens, the big split model only verifies them.
+                     The biggest tokens/sec win on a slow RPC chain.
   --                 everything after is passed to llama-server
 
 How the split works: llama.cpp's RPC backend splits the model by layers across
@@ -168,6 +177,8 @@ def offered_mb(n):
 
 def fresh(n):
     """Re-poll a node's agent so we plan on current free memory, not a 10 s old heartbeat."""
+    if not n.get("agent_port"):
+        return n          # heartbeat-only agent (Windows)
     try:
         m = get_json("http://%s:%s/metrics" % (n.get("lan_ip"), n.get("agent_port", 8788)), timeout=2)
         if m.get("name") != n.get("name"):
@@ -271,6 +282,8 @@ def print_plan(p):
                                                      d["layers"][0], d["layers"][1] - 1))
     if p["unused"]:
         print(C["d"] + "  not needed: " + ", ".join(p["unused"]) + C["0"])
+    if p.get("draft"):
+        print("  speculative decoding with draft model %s on the head" % p["draft"])
     if p["ngl"] < p["n_layer"]:
         print(C["y"] + "  %d layer(s) stay on the head's CPU RAM" % (p["n_layer"] - p["ngl"]) + C["0"])
     if not p["fits"]:
@@ -288,6 +301,11 @@ def build_cmd(p, port, extra):
         cmd += ["--device", ",".join(devs)]
     if len(devs) > 1:
         cmd += ["--tensor-split", ",".join(str(d["split"]) for d in p["devices"] if d["device"] != "CPU")]
+    if p.get("draft_path"):
+        # the draft model stays entirely on the head: its whole point is to avoid the network
+        head_gpu = [d["device"] for d in p["devices"] if d["link"] == "local" and d["device"] != "CPU"]
+        cmd += ["-md", p["draft_path"], "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.8"]
+        cmd += ["-ngld", "999", "--device-draft", head_gpu[0]] if head_gpu else ["-ngld", "0"]
     return cmd + list(extra)
 
 
@@ -320,7 +338,7 @@ def alive(pid):
 
 def cmd_run(args, dry=False):
     opts = {"ctx": 8192, "port": int(cfg("LLAMA_PORT", "8080")), "only": None, "exclude": None,
-            "head_gpu": True, "cpu_only": False, "margin": 12, "wifi": None}
+            "head_gpu": True, "cpu_only": False, "margin": 12, "wifi": None, "draft": None}
     extra, model = [], None
     it = iter(args)
     for a in it:
@@ -342,6 +360,8 @@ def cmd_run(args, dry=False):
             opts["cpu_only"] = True
         elif a == "--wifi":
             opts["wifi"] = True
+        elif a == "--draft":
+            opts["draft"] = next(it)
         elif a.startswith("-"):
             die("unknown option %s" % a)
         else:
@@ -353,6 +373,15 @@ def cmd_run(args, dry=False):
     if not os.path.exists(model):
         die("%s not found (looked in %s too)" % (model, MODELS))
     p = plan(model, opts["ctx"], opts["margin"], opts["only"], opts["exclude"], opts["head_gpu"], opts["cpu_only"], opts["wifi"])
+    if opts["draft"]:
+        d = opts["draft"]
+        if not os.path.exists(d) and os.path.exists(os.path.join(MODELS, d)):
+            d = os.path.join(MODELS, d)
+        if not os.path.exists(d):
+            die("draft model %s not found" % opts["draft"])
+        p["draft"] = read_gguf(d)["name"]
+        p["draft_path"] = os.path.abspath(d)
+        print("  draft model: %s (runs on the head%s)" % (p["draft"], ", GPU" if any(x["device"] != "CPU" and x["link"] == "local" for x in p["devices"]) else ""))
     print_plan(p)
     cmd = build_cmd(p, opts["port"], extra)
     print(C["d"] + "  " + " ".join(cmd) + C["0"])
@@ -451,6 +480,152 @@ def cmd_nodes():
             "local" if n.get("role") == "head" else ("up" if (n.get("rpc") or {}).get("listening") else "down")))
 
 
+# ---------------------------------------------------------------------------
+# one controller: ssh to every device with the head's key
+# ---------------------------------------------------------------------------
+def ssh_target(n):
+    """(user, host, port) for a node, or None when it cannot be reached over ssh."""
+    host = n.get("lan_ip") or n.get("remote_ip")
+    if not host:
+        return None
+    if n.get("os") == "android":
+        return ("termux", host, 8022)        # Termux sshd ignores the username
+    if n.get("os") == "windows":
+        return None
+    return ("root", host, 22)
+
+
+def ssh_cmd(n, cmd, tty=False):
+    t = ssh_target(n)
+    if not t:
+        return None
+    user, host, port = t
+    base = ["ssh", "-i", cfg("SSH_KEY", "/etc/home-cluster/id_ed25519"), "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=6", "-p", str(port)]
+    if tty:
+        base.append("-t")
+    return base + ["%s@%s" % (user, host)] + ([cmd] if cmd else [])
+
+
+def pick_nodes(sel):
+    nodes = get_json(CLUSTERD + "/api/nodes")
+    if sel == "--all":
+        return [n for n in nodes if n.get("role") != "head"]
+    m = [n for n in nodes if n["name"] == sel]
+    if not m:
+        die("unknown node %s (cluster nodes lists them)" % sel)
+    return m
+
+
+def cmd_exec(args):
+    if len(args) < 3 or args[1] != "--":
+        die("usage: cluster exec NODE|--all -- COMMAND ...")
+    cmd = " ".join(args[2:])
+    import concurrent.futures
+    nodes = pick_nodes(args[0])
+
+    def one(n):
+        c = ssh_cmd(n, cmd)
+        if not c:
+            return n["name"], 1, "no ssh route (Windows workers are not reachable this way)\n"
+        if not n.get("awake"):
+            return n["name"], 1, "asleep (last seen %d s ago)\n" % n.get("age_s", 0)
+        r = subprocess.run(c, capture_output=True, text=True, timeout=120)
+        return n["name"], r.returncode, r.stdout + r.stderr
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for name, rc, out in ex.map(one, nodes):
+            col = C["g"] if rc == 0 else C["r"]
+            print(col + "── %s (exit %d)" % (name, rc) + C["0"])
+            print(out.rstrip() or "(no output)")
+
+
+def cmd_restart(args):
+    sel = args[0] if args else "--all"
+    nodes = pick_nodes(sel)
+    for n in nodes:
+        cmd = "sv restart rpc-server cluster-agent" if n.get("os") == "android" else "systemctl restart rpc-server cluster-agent"
+        c = ssh_cmd(n, cmd)
+        if not c:
+            print(C["y"] + "  %s: restart it on the PC (Get-ScheduledTask 'home-cluster*' | Start-ScheduledTask)" % n["name"] + C["0"])
+            continue
+        r = subprocess.run(c, capture_output=True, text=True, timeout=60)
+        print(("  %s: " % n["name"]) + (C["g"] + "restarted" + C["0"] if r.returncode == 0 else C["r"] + "failed: " + (r.stderr.strip() or r.stdout.strip()) + C["0"]))
+
+
+def cmd_ssh(args):
+    if not args:
+        die("usage: cluster ssh NODE")
+    n = pick_nodes(args[0])[0]
+    c = ssh_cmd(n, None, tty=True)
+    if not c:
+        die("%s is not reachable over ssh" % n["name"])
+    os.execvp(c[0], c)
+
+
+def cmd_share(args):
+    """Dashboard (8787) and Open WebUI (30080) through Tailscale Serve, or publicly via Funnel."""
+    mode = args[0] if args else "tailnet"
+    ts = ["tailscale"]
+    if mode == "off":
+        subprocess.run(ts + ["serve", "reset"]); subprocess.run(ts + ["funnel", "reset"], capture_output=True)
+        print("sharing off")
+        return
+    public = mode == "--public"
+    if public:
+        print(C["y"] + "public: Open WebUI will be reachable from the internet on your tailnet's *.ts.net name, behind its own login."
+              " The dashboard and the model API stay tailnet-only; rpc-server never leaves the LAN." + C["0"])
+    r = subprocess.run(ts + ["serve", "--bg", "--https=8443", "http://127.0.0.1:%s" % cfg("CLUSTERD_PORT", "8787")], capture_output=True, text=True)
+    if r.returncode:
+        die("tailscale serve failed: %s (is Tailscale up? run `tailscale up --ssh`)" % (r.stderr.strip() or r.stdout.strip()))
+    subprocess.run((ts + ["funnel", "--bg", "--https=443", "http://127.0.0.1:30080"]) if public else
+                   (ts + ["serve", "--bg", "--https=443", "http://127.0.0.1:30080"]), capture_output=True)
+    name = subprocess.run(ts + ["status", "--self", "--json"], capture_output=True, text=True).stdout
+    try:
+        name = json.loads(name)["Self"]["DNSName"].rstrip(".")
+    except Exception:
+        name = "<this-machine>.<tailnet>.ts.net"
+    print("dashboard:  https://%s:8443   (tailnet only)" % name)
+    print("Open WebUI: https://%s        (%s)" % (name, "PUBLIC via Tailscale Funnel" if public else "tailnet only"))
+
+
+def cmd_models():
+    try:
+        nodes = get_json(CLUSTERD + "/api/nodes")
+        pool = sum(offered_mb(n) for n in nodes if n.get("awake") and (n.get("role") == "head" or (n.get("rpc") or {}).get("listening")))
+    except Exception:
+        pool = None
+    files = sorted(f for f in os.listdir(MODELS) if f.endswith(".gguf")) if os.path.isdir(MODELS) else []
+    if not files:
+        print("no .gguf files in %s" % MODELS)
+        return
+    print("  %-50s %-10s %-7s %s" % ("model", "size", "layers", "fits now?" if pool is not None else ""))
+    for f in files:
+        try:
+            i = read_gguf(os.path.join(MODELS, f))
+            fit = "" if pool is None else ("yes" if i["size_mb"] * 1.15 < pool else "no (~%s needed, %s pooled)" % (gb(int(i["size_mb"] * 1.15)), gb(pool)))
+            print("  %-50s %-10s %-7d %s" % (f[:50], gb(i["size_mb"]), i["n_layer"], fit))
+        except SystemExit:
+            print("  %-50s (unreadable)" % f[:50])
+
+
+def cmd_ui(args):
+    k8s = cfg("K8S_DIR", "/opt/home-cluster/k8s")
+    manifest = os.path.join(k8s, "open-webui.yaml")
+    if not os.path.exists(manifest):
+        die("%s not found; re-run head.sh" % manifest)
+    url = "http://%s:%d" % (cfg("HEAD", "head"), int(cfg("LLAMA_PORT", "8080")))
+    text = open(manifest).read().replace("__LLAMA_URL__", url + "/v1")
+    if args and args[0] == "stop":
+        subprocess.run(["kubectl", "delete", "-f", "-"], input=text, text=True)
+        return
+    r = subprocess.run(["kubectl", "apply", "-f", "-"], input=text, text=True)
+    if r.returncode:
+        die("kubectl apply failed; is k3s running on the head?")
+    print(C["g"] + "Open WebUI" + C["0"] + " will be at http://%s:30080 once the image is pulled (kubectl -n home-cluster get pods)" % cfg("HEAD", "head"))
+    print("  it talks to llama-server at %s" % url)
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -466,6 +641,18 @@ def main(argv):
         cmd_stop()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "ui":
+        cmd_ui(args)
+    elif cmd == "exec":
+        cmd_exec(args)
+    elif cmd == "restart":
+        cmd_restart(args)
+    elif cmd == "ssh":
+        cmd_ssh(args)
+    elif cmd == "share":
+        cmd_share(args)
+    elif cmd == "models":
+        cmd_models()
     elif cmd == "logs":
         os.execvp("tail", ["tail", "-n", "100"] + (["-f"] if "-f" in args else []) + [LOG_FILE])
     else:

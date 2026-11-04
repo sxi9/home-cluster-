@@ -1,0 +1,64 @@
+# Open WebUI on the cluster, pointed at llama-server on the head.
+# Applied by `cluster ui`; __LLAMA_URL__ is filled in with http://HEAD:8080/v1.
+# Reach it at http://HEAD:30080 (NodePort). Data lives in a local-path PVC
+# pinned to the head so it survives pod restarts.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: home-cluster
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-data
+  namespace: home-cluster
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: home-cluster
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: open-webui}
+  template:
+    metadata:
+      labels: {app: open-webui}
+    spec:
+      nodeSelector:
+        home-cluster/role: head        # next to the model and the PVC
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:main
+          ports: [{containerPort: 8080}]
+          env:
+            - {name: OPENAI_API_BASE_URL, value: "__LLAMA_URL__"}
+            - {name: OPENAI_API_KEY, value: "none"}
+            - {name: ENABLE_OLLAMA_API, value: "false"}
+            - {name: WEBUI_AUTH, value: "true"}
+          volumeMounts:
+            - {name: data, mountPath: /app/backend/data}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 2Gi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: open-webui-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: home-cluster
+spec:
+  type: NodePort
+  selector: {app: open-webui}
+  ports:
+    - {port: 8080, targetPort: 8080, nodePort: 30080}

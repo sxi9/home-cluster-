@@ -89,6 +89,9 @@ grep -q "laptop2 *wired" "$T/plan.txt" && ok "wired worker in plan" || fail "lap
 grep -q "phone-a" "$T/plan.txt" && ok "wifi phone pulled in because the model needs it" || fail "phone-a missing"
 "$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --exclude phone-a | grep -q "stay on the head" && ok "--exclude honoured, remainder on head CPU" || fail "exclude"
 
+"$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --draft test-24b-q4.gguf | grep -q -- "-md .*--device-draft Vulkan0" && ok "speculative decoding wired to the head GPU" || fail "draft"
+"$REPO/bin/cluster" models | grep -q "test-24b-q4.gguf.*48" && ok "cluster models lists the share" || fail "models"
+
 # 4. run against the fake server
 "$REPO/bin/cluster" run test-24b-q4.gguf --ctx 4096 | grep -q "^running" && ok "cluster run reached running" || fail "run"
 st=$(curl -fsS "http://127.0.0.1:$PORT_D/api/state")

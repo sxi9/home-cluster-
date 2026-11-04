@@ -21,7 +21,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AWAKE_S = 30          # a node is "awake" if it heartbeated within this many seconds
-JOIN_FILES = {"worker.sh", "android.sh", "join.sh", "cluster-agent.py", "cluster.env", "token"}
+JOIN_FILES = {"worker.sh", "android.sh", "join.sh", "worker.ps1", "cluster-agent.py", "cluster.env", "token", "head.pub"}
 
 
 def read_env(path):
@@ -164,6 +164,9 @@ class Handler(BaseHTTPRequestHandler):
                     body = f.read()
             except OSError:
                 return self._send(404, {"error": "%s not published yet" % name})
+            if name.endswith(".ps1"):
+                me = cfg("JOIN_URL") or "http://%s:%s" % (cfg("HEAD", self.server.server_address[0]), cfg("CLUSTERD_PORT", "8787"))
+                body = body.replace(b'$JoinUrlDefault = ""', ('$JoinUrlDefault = "%s"' % me).encode(), 1)
             if name.endswith(".sh"):
                 # bake this head's address into the script, so `curl | bash` needs no flags
                 # even on phones, which cannot resolve .local names

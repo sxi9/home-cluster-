@@ -68,6 +68,13 @@ optionally Tailscale from F-Droid or the Play Store first):
 pkg install curl && curl -fsSL http://HEAD-IP:8787/android.sh | bash
 ```
 
+**3b. A Windows PC without rebooting** (model pool only, elevated PowerShell;
+uses the official prebuilt llama.cpp release matching the head's pin):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "iwr -useb http://HEAD-IP:8787/worker.ps1 -OutFile $env:TEMP\worker.ps1; & $env:TEMP\worker.ps1"
+```
+
 **4. Run a model** on the head:
 
 ```bash
@@ -77,6 +84,27 @@ cluster plan  Qwen2.5-32B-Instruct-Q4_K_M.gguf   # see the split, change nothing
 cluster run   Qwen2.5-32B-Instruct-Q4_K_M.gguf   # start it
 curl http://HEAD-IP:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+Faster and friendlier:
+
+```bash
+cluster run big.gguf --draft small.gguf   # speculative decoding: the biggest tok/s win on an RPC chain
+cluster ui                                # Open WebUI on k3s at http://HEAD-IP:30080
+cluster models                            # what is in the share and whether it fits right now
+```
+
+**5. One controller for every device**, from the head:
+
+```bash
+cluster exec --all -- uptime                       # any command on every device over ssh
+cluster exec phone-a -- 'sv status rpc-server'     # or one device
+cluster restart --all                              # restart rpc-server + agent everywhere
+cluster ssh laptop2                                # interactive shell
+```
+
+Workers authorise the head's ssh key when they join (root on Ubuntu, the
+Termux user on phones, sshd on port 8022). Windows workers are managed with
+their own scheduled tasks and are not reachable this way.
 
 No flags are needed anywhere: the served scripts carry the head's address,
 workers fetch the token and version pins from the head, and generic hostnames
@@ -116,13 +144,16 @@ dependencies, works offline on the LAN and over Tailscale.
 | `join.sh` | any | `join.sh head \| worker \| android`, from a checkout or piped from the head |
 | `head.sh` | head | k3s server, NFS export, llama.cpp build, clusterd, join files, pins |
 | `worker.sh` | Ubuntu workers | packages, Tailscale, NFS mount, rpc-server build + service, agent, k3s agent |
-| `android.sh` | Termux phones | rpc-server build (Adreno OpenCL or CPU), termux-services, boot start, root tweaks |
-| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs` |
+| `android.sh` | Termux phones | rpc-server build (Adreno OpenCL or CPU), termux-services, boot start, sshd, root tweaks |
+| `worker.ps1` | Windows PCs | native worker: prebuilt llama.cpp release, startup tasks, heartbeat agent; model pool only |
+| `k8s/open-webui.yaml` | head (k3s) | Open WebUI deployment applied by `cluster ui` |
+| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `ui`, `exec`, `restart`, `ssh`, `share` |
 | `head/clusterd.py` | head | one service: join files, heartbeats, `/api/state`, the dashboard |
 | `dashboard/index.html` | head | the dashboard page |
 | `agent/cluster-agent.py` | every node | `/metrics` endpoint + heartbeat; standard library only |
 | `tests/smoke.sh` | dev | end-to-end test with fake nodes and a fake llama-server; runs in CI |
 | `CHECKLIST.md` | you | per-device setup checklist and build progress |
+| `CLAUDE.md`, `docs/SESSION-LOG.md` | you + Claude | project memory: decisions, conventions, the design conversation |
 | `docs/` | you | GPU and phone details, troubleshooting |
 
 ## GPU support
@@ -139,6 +170,22 @@ A GPU's VRAM is added to the pool and its layers run much faster than on CPU.
 Phone GPUs use unified memory, so they do not add capacity. Details and
 measured caveats in [docs/gpu-and-phones.md](docs/gpu-and-phones.md).
 
+## Remote and public access
+
+Everything is designed for the home LAN. For use away from home:
+
+```bash
+cluster share              # dashboard + Open WebUI on your tailnet (Tailscale Serve), HTTPS, nothing public
+cluster share --public     # Open WebUI also on the internet via Tailscale Funnel, behind its own login
+cluster share off
+```
+
+Do not put the head on a public IP or port-forward to it. Port 8787 serves the
+k3s token, `rpc-server` has no authentication, and `llama-server` has no login.
+The per-token model traffic between devices must stay on the LAN anyway; it is
+far too chatty for the internet. Tailscale gives you the dashboard, the API,
+`cluster ssh`, and the chat UI from anywhere without opening a single port.
+
 ## Honest status
 
 - Nothing here has been run on real hardware yet. Every script passed
@@ -148,24 +195,23 @@ measured caveats in [docs/gpu-and-phones.md](docs/gpu-and-phones.md).
 - Phones join the model pool and the dashboard, but not k3s. Stock Android
   kernels lack what k3s needs. `android.sh --chroot` sets up an Ubuntu chroot
   for experiments, nothing more.
-- Windows joins by booting into Ubuntu. A native Windows `rpc-server` would work
-  for the model pool (not k3s) and is a small addition.
+- Windows joins either by booting into Ubuntu (full worker with k3s) or
+  natively with `worker.ps1` (model pool only). `worker.ps1` could not be
+  syntax-checked here (no PowerShell in the build container).
 - iOS cannot run any of this without a custom app. See the roadmap.
 - The k3s token travels over the home LAN in the clear from the head's join
   service. Keep port 8787 inside the LAN (the scripts add ufw rules for that).
 
 ## Roadmap: what else can be added
 
-- **Windows native worker**: `rpc-server` built with CUDA or Vulkan on Windows,
-  joining the model pool without a reboot into Ubuntu.
 - **iOS / iPadOS**: a small sideloaded app embedding llama.cpp's rpc-server and
   the agent. No root needed, but it needs Xcode and an Apple ID to sideload.
 - **Better splitting**: [prima.cpp](https://github.com/OpenCPIL/prima.cpp)
   claims 5 to 17 times lower latency than plain llama.cpp RPC on exactly this
   kind of mixed home cluster, with Android support. Worth a bake-off once the
   cluster runs.
-- **A chat UI**: Open WebUI or any OpenAI-compatible client pointed at
-  `http://HEAD-IP:8080`, deployed as a k3s service.
+- **Speculative decoding tuning** per model pair; **KV cache quantization**
+  and flash attention flags passed through `cluster run -- ...`.
 - **More in k3s**: Longhorn or NFS-backed volumes, Pi-hole, Home Assistant,
   Immich, media servers, running across the Ubuntu nodes.
 - **Wake-on-LAN** from the dashboard for sleeping laptops, and a thermal-aware

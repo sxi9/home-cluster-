@@ -43,6 +43,13 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Reboot the phone: `sv status` shows both services back within a minute
 - [ ] Decide CPU vs GPU per phone: see docs/gpu-and-phones.md, re-run with `--gpu cpu` if CPU is faster
 
+## Windows PC (native, optional)
+
+- [ ] Elevated PowerShell; paste the `worker.ps1` command head.sh printed
+- [ ] `Get-ScheduledTask 'home-cluster*'` shows both tasks Running; `Get-Process rpc-server`
+- [ ] On the head: `cluster nodes` lists it awake with rpc `up`
+- [ ] If CUDA was chosen, `nvidia-smi` shows rpc-server using the GPU during a run
+
 ## First model run
 
 - [ ] `cluster plan MODEL.gguf` shows every awake device and no "does not fit"
@@ -50,6 +57,10 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Dashboard shows the layer split and a tokens/sec number while a request runs
 - [ ] `curl http://HEAD-IP:8080/v1/chat/completions ...` answers
 - [ ] Try `--exclude phone-x` and `--wifi` to see how the split and speed change
+- [ ] `cluster run big.gguf --draft small.gguf` and compare tokens/sec on the dashboard
+- [ ] `cluster ui`, open http://HEAD-IP:30080, create the admin account, chat
+- [ ] `cluster exec --all -- uptime` reaches every Ubuntu and Termux device
+- [ ] `cluster share`, open the dashboard from a phone on mobile data via Tailscale
 
 ## Build progress
 
@@ -65,5 +76,7 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Tested on the two laptops
 - [ ] Tested on one phone
 - [ ] Ubuntu chroot on a phone (experimental, `android.sh --chroot`)
-- [ ] Windows native worker
+- [x] Windows native worker (worker.ps1, untested)
+- [x] Speculative decoding, Open WebUI, one-controller `cluster exec`, `cluster share`
+- [ ] Tested worker.ps1 on the Windows laptop
 - [ ] iOS worker app
