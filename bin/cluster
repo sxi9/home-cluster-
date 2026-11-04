@@ -20,6 +20,10 @@
                                       bandwidth; finds the slowest device; feeds the planner
   cluster tune [KEY=VALUE ...]        show / set optimization settings (flash attention,
                                       KV cache type, batch sizes, threads, draft params...)
+  cluster tune --auto                 optimize everything from what the devices report
+  cluster password [NEW]              set the dashboard admin password
+  cluster failover [status|promote|demote]
+                                      master/fallback state; force a standby up or down
 
 run/plan options:
   --ctx N            context size (default 8192)
@@ -725,8 +729,57 @@ def cmd_share(args):
     print("Open WebUI: https://%s        (%s)" % (name, "PUBLIC via Tailscale Funnel" if public else "tailnet only"))
 
 
+def auto_tune():
+    """Pick settings from what the devices actually are. Returns (settings, reasons)."""
+    t = load_tuning()
+    reasons = []
+    try:
+        nodes = get_json(CLUSTERD + "/api/nodes")
+    except Exception:
+        nodes = []
+    awake = [n for n in nodes if n.get("awake")]
+    gpus = [n for n in awake if (n.get("gpu") or {}).get("kind", "cpu") != "cpu"]
+    head = next((n for n in nodes if n.get("role") == "head"), {})
+    bench = load_bench()
+    wifi = [n for n in awake if n.get("link") == "wifi" and n.get("role") != "head"]
+    if gpus:
+        t["FLASH_ATTN"] = "on"; reasons.append("FLASH_ATTN=on: %d GPU device(s) in the pool" % len(gpus))
+    else:
+        t["FLASH_ATTN"] = "auto"; reasons.append("FLASH_ATTN=auto: CPU-only pool")
+    t["KV_CACHE_TYPE"] = "q8_0"; reasons.append("KV_CACHE_TYPE=q8_0: halves the KV cache so more layers fit per device")
+    t["ORDER"] = "bench" if bench else "heuristic"
+    reasons.append("ORDER=%s: %s" % (t["ORDER"], "measured speeds available" if bench else "run `cluster bench` to switch to measured speeds"))
+    if wifi:
+        wtps = [bench.get(n["name"], {}).get("tg_tps") for n in wifi]
+        wired_tps = [v.get("tg_tps") for k, v in bench.items() if v.get("tg_tps") and k not in {n["name"] for n in wifi}]
+        if any(wtps) and wired_tps and min(x for x in wtps if x) < max(wired_tps) / 3:
+            t["WIFI_MAX_PCT"] = "15"; reasons.append("WIFI_MAX_PCT=15: Wi-Fi devices measure under a third of the fastest wired one")
+        else:
+            t["WIFI_MAX_PCT"] = "25"; reasons.append("WIFI_MAX_PCT=25: %d Wi-Fi device(s), keep most layers on wired ones" % len(wifi))
+    else:
+        t["WIFI_MAX_PCT"] = "100"; reasons.append("WIFI_MAX_PCT=100: no Wi-Fi devices")
+    cores = (head.get("cpu") or {}).get("cores") or os.cpu_count() or 4
+    t["THREADS"] = str(max(1, cores - 1)); reasons.append("THREADS=%s: head has %d cores, one kept for the OS and the agents" % (t["THREADS"], cores))
+    free = (head.get("mem") or {}).get("free_mb") or 0
+    if free > 12 * 1024:
+        t["MLOCK"] = "on"; reasons.append("MLOCK=on: head has %s free, keep the model's pages from swapping" % gb(free))
+    else:
+        t["MLOCK"] = "off"; reasons.append("MLOCK=off: head has only %s free" % gb(free))
+    phones = [n for n in awake if n.get("os") == "android"]
+    t["UBATCH"] = "256" if phones else "512"; reasons.append("UBATCH=%s: %s" % (t["UBATCH"], "phones in the pool, smaller physical batches" if phones else "no phones, default batches"))
+    t["BATCH"] = "2048"
+    t["MARGIN_PCT"] = "15" if phones else "12"; reasons.append("MARGIN_PCT=%s: %s" % (t["MARGIN_PCT"], "extra headroom for Android's memory killer" if phones else "default headroom"))
+    t["DRAFT_MAX"], t["DRAFT_MIN"], t["DRAFT_P_MIN"] = "16", "4", "0.8"
+    return t, reasons
+
+
 def cmd_tune(args):
     t = load_tuning()
+    if args == ["--auto"]:
+        t, reasons = auto_tune()
+        for r in reasons:
+            print("  " + r)
+        args = ["%s=%s" % (k, v) for k, v in t.items()]
     if args:
         for a in args:
             if "=" not in a:
@@ -887,6 +940,61 @@ def cmd_kill(args):
     print("killed" if r.returncode == 0 else "failed: " + (r.stderr.strip() or r.stdout.strip()))
 
 
+def cmd_password(args):
+    import getpass
+    pw = args[0] if args else getpass.getpass("new dashboard password for admin: ")
+    if len(pw) < 6:
+        die("use at least 6 characters")
+    h = subprocess.run([sys.executable, cfg("CLUSTERD_PY", "/opt/home-cluster/clusterd.py"), "--hash", pw],
+                       capture_output=True, text=True).stdout.strip()
+    if not h.startswith("pbkdf2$"):
+        die("could not hash the password (is clusterd.py installed?)")
+    lines = []
+    try:
+        lines = open(ENV_FILE).read().splitlines()
+    except OSError:
+        die("%s not found" % ENV_FILE)
+    lines = [l for l in lines if not l.startswith(("DASHBOARD_PASS_HASH=", "DASHBOARD_USER="))]
+    lines += ["DASHBOARD_USER=admin", "DASHBOARD_PASS_HASH=" + h]
+    with open(ENV_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    subprocess.run(["systemctl", "restart", "clusterd"], capture_output=True)
+    print("password set; clusterd restarted. Login: admin at http://%s:%s" % (cfg("HEAD", "head"), cfg("CLUSTERD_PORT", "8787")))
+
+
+def cmd_failover(args):
+    what = args[0] if args else "status"
+    fo = cfg("FAILOVER_FILE", "/var/lib/home-cluster/failover.json")
+    role = cfg("HEAD_ROLE", "primary")
+    if what == "status":
+        try:
+            r = get_json(CLUSTERD + "/api/role")
+        except Exception:
+            r = {"role": role, "active": None, "standbys": []}
+        print("this head: %s%s" % (r.get("role"), "" if r.get("role") == "primary" else " of primary %s" % cfg("PRIMARY_HEAD", "?")))
+        print("serving   : %s" % ("yes" if r.get("active") else "no (standing by)"))
+        if r.get("role") == "standby":
+            try:
+                get_json("http://%s:%s/api/health" % (cfg("PRIMARY_HEAD"), cfg("CLUSTERD_PORT", "8787")), timeout=3)
+                print("primary   : up")
+            except Exception:
+                print(C["y"] + "primary   : DOWN" + C["0"])
+        sb = r.get("standbys") or []
+        print("standbys  : " + (", ".join("%s (%s%s)" % (s["name"], "awake" if s["awake"] else "asleep", ", ready" if s["ready"] else "") for s in sb) or "none — run `join.sh standby` on another Ubuntu machine"))
+        return
+    if role != "standby":
+        die("promote/demote only make sense on a standby head")
+    st = {"active": what == "promote", "manual": True, "since": time.time(), "reason": "cluster failover %s" % what}
+    os.makedirs(os.path.dirname(fo), exist_ok=True)
+    with open(fo, "w") as f:
+        json.dump(st, f)
+    subprocess.run(["systemctl", "start" if what == "promote" else "stop", "clusterd", "cluster-mdns"], capture_output=True)
+    print("%s: this standby is now %s" % (what, "serving as head" if what == "promote" else "standing by"))
+    print("(manual state is kept until `cluster failover auto`)" if what == "promote" else "")
+    if what == "auto":
+        pass
+
+
 def cmd_models():
     try:
         nodes = get_json(CLUSTERD + "/api/nodes")
@@ -957,6 +1065,18 @@ def main(argv):
         cmd_bench(args)
     elif cmd == "tune":
         cmd_tune(args)
+    elif cmd == "password":
+        cmd_password(args)
+    elif cmd == "failover":
+        if args and args[0] == "auto":
+            fo = cfg("FAILOVER_FILE", "/var/lib/home-cluster/failover.json")
+            try:
+                os.remove(fo)
+            except OSError:
+                pass
+            print("automatic failover resumed")
+        else:
+            cmd_failover(args)
     elif cmd == "models":
         cmd_models()
     elif cmd == "logs":

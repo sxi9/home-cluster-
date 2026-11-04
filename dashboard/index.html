@@ -102,9 +102,13 @@ footer { color:var(--text-3); font-size:12px; margin-top:20px; }
     <h1>home-cluster <small id="headname"></small></h1>
     <span class="pill"><span class="dot" id="statusdot"></span><span id="statustext">connecting</span></span>
     <span class="spacer"></span>
+    <span class="pill" id="standbypill" style="display:none"></span>
     <button id="viewbtn" title="Toggle between cards and a table">Table view</button>
     <button id="themebtn" title="Toggle dark / light">Theme</button>
+    <button id="logoutbtn" style="display:none" onclick="location.href='/logout'">Log out</button>
   </header>
+
+  <div id="banner" class="card hidden" style="border-color:var(--serious);margin-bottom:16px"></div>
 
   <section class="tiles">
     <div class="tile"><div class="k">Generation</div><div class="v" id="t-gen">–<small>tok/s</small></div><div class="sub" id="t-gen-sub">no model running</div></div>
@@ -136,6 +140,11 @@ footer { color:var(--text-3); font-size:12px; margin-top:20px; }
     <h2>Devices</h2>
     <div class="nodes" id="nodes"></div>
     <div id="nodetable" class="hidden"></div>
+  </section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Settings <span class="meta" style="text-transform:none;letter-spacing:0;font-weight:400">· change with <code>cluster tune KEY=VALUE</code> or <code>cluster tune --auto</code></span></h2>
+    <div class="kv" id="settings" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))"></div>
   </section>
 
   <footer id="foot"></footer>
@@ -183,7 +192,22 @@ footer { color:var(--text-3); font-size:12px; margin-top:20px; }
     const run = st.run, llama = st.llama, bench = st.bench || {};
     const measured = Object.entries(bench).filter(([k, v]) => v && v.tg_tps && nodes.some(n => n.name === k && n.awake));
     const slowest = measured.length > 1 ? measured.reduce((a, b) => (b[1].tg_tps < a[1].tg_tps ? b : a))[0] : null;
-    $('headname').textContent = st.head || '';
+    $('headname').textContent = (st.head || '') + (st.role === 'standby' ? ' (standby)' : '');
+    $('logoutbtn').style.display = st.auth ? '' : 'none';
+    // master / fallback
+    const sbs = st.standbys || [];
+    const pill = $('standbypill');
+    if (st.role === 'primary' && sbs.length) { pill.style.display = ''; pill.innerHTML = `<span class="dot ${sbs.some(s => s.awake && s.ready) ? 'good' : 'warn'}"></span>fallback: ${sbs.map(s => esc(s.name) + (s.awake ? (s.ready ? ' ready' : ' not built') : ' asleep')).join(', ')}`; }
+    else if (st.role === 'primary') { pill.style.display = ''; pill.innerHTML = `<span class="dot"></span>no fallback head`; }
+    else pill.style.display = 'none';
+    const banner = $('banner');
+    if (st.role === 'standby') {
+      banner.classList.remove('hidden');
+      banner.innerHTML = `<b style="color:var(--serious)">FAILOVER ACTIVE</b> · this is standby <b>${esc(st.head)}</b> serving because primary <b>${esc(st.primary)}</b> is down${st.failover && st.failover.since ? ' since ' + new Date(st.failover.since * 1000).toLocaleTimeString() : ''}. It steps back automatically when the primary returns.`;
+    } else banner.classList.add('hidden');
+    // settings
+    const tuning = st.tuning || {};
+    $('settings').innerHTML = Object.keys(tuning).length ? Object.entries(tuning).map(([k, v]) => `<span>${esc(k.toLowerCase())} <b>${esc(v)}</b></span>`).join('') : '<span class="meta">defaults (nothing tuned yet) · run <code>cluster tune --auto</code> on the head</span>';
 
     // status pill
     const running = run && run.status === 'running' && llama && llama.up;

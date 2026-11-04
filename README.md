@@ -40,6 +40,11 @@ it all on one dashboard.
   pinned llama.cpp version and the dashboard live on the head. A worker holds a
   config file, a token and two services, so a wiped device rejoins with one
   command.
+- **Master with a fallback.** Any Ubuntu worker can also be a standby head that
+  mirrors the share and takes over when the primary is down.
+- **Login.** The dashboard and its API are behind an admin password (salted
+  hash on the head, week-long sessions); the `cluster` CLI on the head works
+  without it.
 - **k3s for everything else.** The head is the k3s server, Ubuntu workers are
   agents, so grouped services (anything in a container) can run across them.
 
@@ -49,11 +54,12 @@ it all on one dashboard.
 
 ```bash
 git clone https://github.com/sxi9/home-cluster-.git && cd home-cluster-
-sudo ./join.sh head              # or: sudo ./head.sh --gpu cuda
+sudo ./join.sh head --admin-pass 'choose-a-password'    # or: sudo ./head.sh --gpu cuda --admin-pass ...
 ```
 
-It prints the two commands below with your head's address filled in, and the
-dashboard URL `http://HEAD-IP:8787`.
+It prints the join commands below with your head's address filled in, and the
+dashboard URL `http://HEAD-IP:8787` (login: `admin` and the password you chose;
+change it any time with `cluster password`).
 
 **2. Each Ubuntu laptop** (the Windows laptop booted into Ubuntu):
 
@@ -106,6 +112,25 @@ cluster kill phone-b 2990     # kill a process on a device
 After `cluster bench`, the planner orders devices by measured speed instead of
 the wired/GPU heuristic, and the dashboard marks the slowest device with 🐢.
 
+**4c. Optimize everything at once:**
+
+```bash
+cluster tune --auto    # flash attention if GPUs exist, q8_0 KV cache, bench ordering, Wi-Fi cap,
+                       # head threads, mlock when RAM allows, phone-friendly batches; explains each choice
+```
+
+**4d. A fallback head** (master/standby), on a second Ubuntu machine that is
+already a worker:
+
+```bash
+curl -fsSL http://HEAD-IP:8787/join.sh | sudo bash -s standby
+```
+
+If the primary head goes silent for about 40 seconds, the standby starts
+serving the dashboard, join files and `cluster run`; every device's agent
+follows it automatically and returns when the primary is back. Details and
+limits in [docs/failover.md](docs/failover.md).
+
 **5. One controller for every device**, from the head:
 
 ```bash
@@ -152,6 +177,10 @@ dependencies, works offline on the LAN and over Tailscale.
   non-cluster process hogs RAM or CPU, and the exact `cluster ssh` / `cluster kill`
   commands for that device.
 
+| ![login](docs/screenshots/login.png) | ![settings](docs/screenshots/dashboard-failover-settings.png) |
+|---|---|
+| Login (admin + the password set at install) | Fallback head in the header pill, settings panel at the bottom |
+
 <details><summary>Phone-sized view</summary>
 
 ![phone](docs/screenshots/dashboard-phone.png)
@@ -189,8 +218,10 @@ default build is shared libraries (the scripts now build static). See
 | `android.sh` | Termux phones | rpc-server build (Adreno OpenCL or CPU), termux-services, boot start, sshd, root tweaks |
 | `worker.ps1` | Windows PCs | native worker: prebuilt llama.cpp release, startup tasks, heartbeat agent; model pool only |
 | `k8s/open-webui.yaml` | head (k3s) | Open WebUI deployment applied by `cluster ui` |
-| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `bench`, `tune`, `top`, `kill`, `ui`, `exec`, `restart`, `ssh`, `share` |
-| `head/clusterd.py` | head | one service: join files, heartbeats, `/api/state`, the dashboard |
+| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `bench`, `tune [--auto]`, `top`, `kill`, `ui`, `exec`, `restart`, `ssh`, `share`, `password`, `failover` |
+| `head/clusterd.py` | head | one service: join files, heartbeats, `/api/state`, login, the dashboard |
+| `head/cluster-failover.py` | standby head | watchdog: promotes the standby when the primary is silent, steps down when it returns |
+| `docs/failover.md` | you | how master/fallback works and what it cannot do |
 | `dashboard/index.html` | head | the dashboard page |
 | `agent/cluster-agent.py` | every node | `/metrics` endpoint + heartbeat; standard library only |
 | `tests/smoke.sh` | dev | end-to-end test with fake nodes and a fake llama-server; runs in CI |
@@ -243,7 +274,8 @@ far too chatty for the internet. Tailscale gives you the dashboard, the API,
   syntax-checked here (no PowerShell in the build container).
 - iOS cannot run any of this without a custom app. See the roadmap.
 - The k3s token travels over the home LAN in the clear from the head's join
-  service. Keep port 8787 inside the LAN (the scripts add ufw rules for that).
+  service (the join files are the only unauthenticated part of port 8787).
+  Keep the port inside the LAN; the scripts add ufw rules for that.
 
 ## Roadmap: what else can be added
 

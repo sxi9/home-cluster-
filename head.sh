@@ -19,8 +19,13 @@
 #   8. publish     cluster.env (pins), token, worker.sh, android.sh, join.sh
 #   9. host tweaks ufw rules, ignore laptop lid close
 #
+# Master / fallback: run `sudo ./head.sh --standby PRIMARY-IP` on a second Ubuntu
+# machine (after joining it as a worker). It mirrors the share, watches the
+# primary, and takes over dashboard + join service + `cluster run` when the
+# primary is down, then steps back when it returns. Workers follow automatically.
+#
 # Usage:
-#   sudo ./head.sh                 # from a checkout of this repo
+#   sudo ./head.sh --admin-pass 'secret'   # from a checkout; sets the dashboard login
 #   sudo ./head.sh --gpu cuda      # pick the GPU backend (auto: vulkan if a GPU exists)
 #   sudo ./head.sh --dry-run       # print the plan only
 #   sudo ./head.sh --leave         # undo (keeps /srv/cluster/models)
@@ -57,6 +62,11 @@ LLAMA_TAG=""            # release tag of that commit (bNNNN), for Windows prebui
 K3S_VERSION=""
 TS_AUTHKEY="${TS_AUTHKEY:-}"
 HEAD_SSH=""             # Tailscale name workers ssh to; defaults to the hostname
+ADMIN_PASS="${ADMIN_PASS:-}"   # dashboard password for user admin (prompted if missing)
+STANDBY_OF=""           # --standby PRIMARY-IP: this machine is a fallback head
+HEAD_ROLE=primary
+DASHBOARD_PASS_HASH=""
+SESSION_SECRET=""
 DO_TAILSCALE=1 DO_NFS=1 DO_K3S=1 DO_BUILD=1 DO_LID=1 DRY_RUN=0 LEAVE=0
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -82,6 +92,8 @@ Options:
   --k3s-version VER      pin k3s (default: installer default, then pinned)
   --mdns-name NAME       publish NAME.local for the join service (default $MDNS_NAME)
   --tailscale-authkey K  non-interactive 'tailscale up'
+  --admin-pass PASS      dashboard login for user admin (or env ADMIN_PASS; prompted otherwise)
+  --standby PRIMARY-IP   make this machine a fallback head for that primary
   --no-tailscale | --no-nfs | --no-k3s | --no-build | --no-lid-ignore
   --dry-run | --leave | -h
 USAGE
@@ -98,6 +110,8 @@ parse_args() {
       --k3s-version) K3S_VERSION=$2; shift 2 ;;
       --mdns-name) MDNS_NAME=$2; shift 2 ;;
       --tailscale-authkey) TS_AUTHKEY=$2; shift 2 ;;
+      --admin-pass) ADMIN_PASS=$2; shift 2 ;;
+      --standby) STANDBY_OF=$2; HEAD_ROLE=standby; shift 2 ;;
       --no-tailscale) DO_TAILSCALE=0; shift ;;
       --no-nfs) DO_NFS=0; shift ;;
       --no-k3s) DO_K3S=0; shift ;;
@@ -116,7 +130,7 @@ load_saved() {
   log "loading saved settings from $ENV_FILE (flags override)"
   local k v
   while IFS='=' read -r k v; do
-    case $k in NODE_NAME|LAN_IFACE|GPU|LLAMA_REF|K3S_VERSION|HEAD_SSH|MDNS_NAME) printf -v "$k" '%s' "$v" ;; esac
+    case $k in NODE_NAME|LAN_IFACE|GPU|LLAMA_REF|K3S_VERSION|HEAD_SSH|MDNS_NAME|DASHBOARD_PASS_HASH|SESSION_SECRET|PRIMARY_HEAD|HEAD_ROLE) printf -v "$k" '%s' "$v" ;; esac
   done < <(grep -E '^[A-Z0-9_]+=' "$ENV_FILE")
 }
 
@@ -136,13 +150,22 @@ preflight() {
   detect_gpu
   NODE_NAME=${NODE_NAME:-$(hostname -s)}
   HEAD_SSH=${HEAD_SSH:-$NODE_NAME}
+  if [[ -n $STANDBY_OF ]]; then
+    PRIMARY_HEAD=$STANDBY_OF; HEAD_ROLE=standby; DO_K3S=0; DO_NFS=0
+    [[ -r /etc/home-cluster/worker.env ]] || warn "join this machine as a worker first (worker.sh), so it mounts the primary's share to mirror"
+  elif [[ ${HEAD_ROLE:-primary} == standby && -n ${PRIMARY_HEAD:-} ]]; then
+    DO_K3S=0; DO_NFS=0          # saved standby settings
+  else
+    HEAD_ROLE=primary; PRIMARY_HEAD=$LAN_IP
+  fi
   MEM_TOTAL_MB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
   SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")
   cat <<INFO
     head        : $NODE_NAME ($ARCH, ${MEM_TOTAL_MB} MB RAM, $(nproc) cpus)
     lan         : $LAN_IFACE $LAN_IP ($LINK_TYPE), subnet $LAN_SUBNET
     gpu         : $GPU${GPU_NAME:+ ($GPU_NAME)}
-    share       : $ROOT (nfs to $LAN_SUBNET)
+    role        : $HEAD_ROLE${PRIMARY_HEAD:+ (primary $PRIMARY_HEAD)}
+    share       : $ROOT $( (( DO_NFS )) && echo "(nfs to $LAN_SUBNET)" || echo "(mirror of the primary)" )
     join url    : http://$LAN_IP:$CLUSTERD_PORT  (also http://$MDNS_NAME.local:$CLUSTERD_PORT)
     llama.cpp   : $LLAMA_REF
 INFO
@@ -292,20 +315,56 @@ locate_repo() {
   else run git clone --quiet "$REPO_URL" "$REPO_DIR"; fi
 }
 
+setup_login() {
+  log "dashboard login"
+  if [[ -z $SESSION_SECRET ]]; then SESSION_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'); fi
+  if [[ -n $ADMIN_PASS ]]; then
+    (( ${#ADMIN_PASS} >= 6 )) || die "--admin-pass: use at least 6 characters"
+    DASHBOARD_PASS_HASH=$(python3 "$REPO_DIR/head/clusterd.py" --hash "$ADMIN_PASS")
+  elif [[ -z $DASHBOARD_PASS_HASH ]]; then
+    if [[ -t 0 ]] && (( ! DRY_RUN )); then
+      local p1 p2
+      while :; do
+        read -r -s -p "  dashboard password for user 'admin': " p1; echo
+        read -r -s -p "  again: " p2; echo
+        [[ $p1 == "$p2" && ${#p1} -ge 6 ]] && break
+        echo "  passwords differ or shorter than 6 characters, try again"
+      done
+      DASHBOARD_PASS_HASH=$(python3 "$REPO_DIR/head/clusterd.py" --hash "$p1")
+    else
+      ADMIN_PASS=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 12)
+      if (( DRY_RUN )); then DASHBOARD_PASS_HASH='pbkdf2$...'; else DASHBOARD_PASS_HASH=$(python3 "$REPO_DIR/head/clusterd.py" --hash "$ADMIN_PASS"); fi
+      warn "no --admin-pass and no terminal: generated password '$ADMIN_PASS' (change with: cluster password)"
+    fi
+  else
+    log "keeping the saved dashboard password (change with: cluster password)"
+  fi
+}
+
 install_app() {
   log "clusterd, agent, cluster command"
   locate_repo
+  setup_login
   run install -d -m 0755 "$APP_DIR"
   run install -m 0755 "$REPO_DIR/head/clusterd.py" "$APP_DIR/clusterd.py"
   run install -m 0644 "$REPO_DIR/dashboard/index.html" "$APP_DIR/index.html"
   run install -m 0755 "$REPO_DIR/agent/cluster-agent.py" "$APP_DIR/cluster-agent.py"
+  run install -m 0755 "$REPO_DIR/head/cluster-failover.py" "$APP_DIR/cluster-failover.py"
   run install -m 0755 "$REPO_DIR/bin/cluster" /usr/local/bin/cluster
   run install -d -m 0755 "$APP_DIR/k8s"
   run install -m 0644 "$REPO_DIR"/k8s/*.yaml "$APP_DIR/k8s/"
-  write_file "$ENV_FILE" 0644 <<ENV
+  write_file "$ENV_FILE" 0640 "root:$SERVICE_USER" <<ENV
 # home-cluster head settings — written by head.sh
 NODE_NAME=$NODE_NAME
 ROLE=head
+HEAD_ROLE=$HEAD_ROLE
+PRIMARY_HEAD=$PRIMARY_HEAD
+STANDBY=$( [[ $HEAD_ROLE == standby ]] && echo 1 || echo 0 )
+DASHBOARD_USER=admin
+DASHBOARD_PASS_HASH=$DASHBOARD_PASS_HASH
+SESSION_SECRET=$SESSION_SECRET
+FAILOVER_FILE=$SERVICE_HOME/failover.json
+CLUSTERD_PY=$APP_DIR/clusterd.py
 HEAD=$LAN_IP
 HEAD_SSH=$HEAD_SSH
 JOIN_URL=http://$LAN_IP:$CLUSTERD_PORT
@@ -381,8 +440,72 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
   run systemctl daemon-reload
-  run systemctl enable --now clusterd.service cluster-agent.service cluster-mdns.service
-  run systemctl restart clusterd.service cluster-agent.service cluster-mdns.service
+  if [[ $HEAD_ROLE == primary ]]; then
+    run systemctl disable --now cluster-failover.service cluster-mirror.timer 2>/dev/null || true
+    run systemctl enable --now clusterd.service cluster-agent.service cluster-mdns.service
+    run systemctl restart clusterd.service cluster-agent.service cluster-mdns.service
+  else
+    install_standby
+  fi
+}
+
+# A standby keeps clusterd + mDNS installed but stopped; the watchdog starts
+# them when the primary disappears. The share is mirrored from the primary's
+# NFS mount every 10 minutes, so models and join files are here when needed.
+install_standby() {
+  log "standby of $PRIMARY_HEAD: watchdog + mirror"
+  # the worker agent on this machine must announce it as a standby head
+  if [[ -r /etc/home-cluster/worker.env ]]; then
+    if grep -q '^STANDBY=' /etc/home-cluster/worker.env; then
+      run sed -i 's/^STANDBY=.*/STANDBY=1/' /etc/home-cluster/worker.env
+    elif (( DRY_RUN )); then
+      printf '    + append STANDBY=1 to /etc/home-cluster/worker.env\n'
+    else
+      printf 'STANDBY=1\nLLAMA_BIN=%s/bin\n' "$INSTALL_DIR" >> /etc/home-cluster/worker.env
+    fi
+    run systemctl restart cluster-agent.service 2>/dev/null || true
+  fi
+  write_file /etc/systemd/system/cluster-failover.service 0644 <<UNIT
+[Unit]
+Description=home-cluster failover watchdog (standby head)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CLUSTER_ENV=$ENV_FILE
+ExecStart=/usr/bin/python3 $APP_DIR/cluster-failover.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  write_file /etc/systemd/system/cluster-mirror.service 0644 <<UNIT
+[Unit]
+Description=home-cluster: mirror the primary's share to this standby
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'test -d /mnt/cluster/models && rsync -a --delete --chown=root:$SERVICE_USER /mnt/cluster/models/ $MODELS_DIR/ && rsync -a --chown=$SERVICE_USER:$SERVICE_USER /mnt/cluster/join/ $JOIN_DIR/ && cp -f /mnt/cluster/cluster.env $ROOT/cluster.env || echo "primary share not mounted; skipped"'
+UNIT
+  write_file /etc/systemd/system/cluster-mirror.timer 0644 <<UNIT
+[Unit]
+Description=home-cluster: mirror the primary's share every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+UNIT
+  run apt-get install -y -qq --no-install-recommends rsync
+  run systemctl daemon-reload
+  run systemctl disable --now clusterd.service cluster-mdns.service 2>/dev/null || true
+  run systemctl enable --now cluster-failover.service cluster-mirror.timer
+  run systemctl start cluster-mirror.service || true
 }
 
 publish_join() {
@@ -443,7 +566,10 @@ summary() {
   log "done"
   cat <<SUMMARY
 
-  Head $NODE_NAME is up.   dashboard: http://$LAN_IP:$CLUSTERD_PORT   share: $ROOT
+  Head $NODE_NAME is up ($HEAD_ROLE).   dashboard: http://$LAN_IP:$CLUSTERD_PORT  (login: admin)   share: $ROOT
+
+  Fallback head (optional): on another Ubuntu machine that already ran worker.sh:
+      curl -fsSL http://$LAN_IP:$CLUSTERD_PORT/join.sh | sudo bash -s standby
 
   Join an Ubuntu laptop (run on that machine):
       curl -fsSL http://$LAN_IP:$CLUSTERD_PORT/worker.sh | sudo bash
@@ -473,7 +599,8 @@ leave() {
   log "tearing down the head (models in $MODELS_DIR are kept)"
   [[ -x /usr/local/bin/k3s-uninstall.sh ]] && run /usr/local/bin/k3s-uninstall.sh
   run systemctl disable --now clusterd.service cluster-agent.service cluster-mdns.service 2>/dev/null || true
-  run rm -f /etc/systemd/system/clusterd.service /etc/systemd/system/cluster-agent.service /etc/systemd/system/cluster-mdns.service /etc/systemd/logind.conf.d/home-cluster.conf /usr/local/bin/cluster
+  run systemctl disable --now cluster-failover.service cluster-mirror.timer 2>/dev/null || true
+  run rm -f /etc/systemd/system/clusterd.service /etc/systemd/system/cluster-agent.service /etc/systemd/system/cluster-mdns.service /etc/systemd/system/cluster-failover.service /etc/systemd/system/cluster-mirror.service /etc/systemd/system/cluster-mirror.timer /etc/systemd/logind.conf.d/home-cluster.conf /usr/local/bin/cluster
   run sed -i "\|^$ROOT |d" /etc/exports; command -v exportfs >/dev/null && run exportfs -ra
   run rm -rf "$CONF_DIR" "$INSTALL_DIR" "$APP_DIR" "$JOIN_DIR" "$STATE_DIR" "$LOG_DIR"
   run systemctl daemon-reload

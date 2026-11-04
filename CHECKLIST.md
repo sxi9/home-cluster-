@@ -12,7 +12,8 @@ Tick these off in order. Each section is independent once the head is up.
 ## Head (Ubuntu laptop)
 
 - [ ] `git clone` the repo, `sudo ./head.sh --dry-run` reads sensibly (interface, GPU, subnet)
-- [ ] `sudo ./head.sh` finishes; note the two join commands it prints
+- [ ] `sudo ./head.sh --admin-pass '...'` finishes; note the join commands it prints
+- [ ] Dashboard asks for a login; `admin` + your password works; Log out works
 - [ ] `systemctl status k3s clusterd cluster-agent cluster-mdns nfs-server` all active
 - [ ] Dashboard opens at `http://HEAD-IP:8787` and shows the head card
 - [ ] `kubectl get nodes` shows the head Ready
@@ -50,6 +51,14 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] On the head: `cluster nodes` lists it awake with rpc `up`
 - [ ] If CUDA was chosen, `nvidia-smi` shows rpc-server using the GPU during a run
 
+## Fallback head (optional, second Ubuntu machine)
+
+- [ ] It is already a worker (`cluster nodes` shows it)
+- [ ] `curl -fsSL http://HEAD-IP:8787/join.sh | sudo bash -s standby` finishes
+- [ ] On the primary: the header pill says `fallback: <name> ready`; `cluster failover status` lists it
+- [ ] Test: power off the primary; within a minute `http://STANDBY-IP:8787` shows the FAILOVER banner and the devices; `cluster run` works there
+- [ ] Power the primary back on; the standby steps down within a minute and devices return
+
 ## First model run
 
 - [ ] `cluster plan MODEL.gguf` shows every awake device and no "does not fit"
@@ -83,5 +92,6 @@ Tick these off in order. Each section is independent once the head is up.
 - [x] Speculative decoding, Open WebUI, one-controller `cluster exec`, `cluster share`
 - [x] `cluster bench` / `cluster tune` / `cluster top` / `cluster kill`, hardware details, network diagram
 - [x] Real RPC split verified in the cloud with llama.cpp master (see README)
+- [x] Dashboard login, `cluster tune --auto`, standby head with automatic failover (untested on hardware)
 - [ ] Tested worker.ps1 on the Windows laptop
 - [ ] iOS worker app

@@ -22,6 +22,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HEARTBEAT_S = 10
+FALLBACK_FILE = os.path.join(os.environ.get("HOME") or "/var/lib/home-cluster", ".cluster-fallbacks.json")
 
 
 def read_env(path):
@@ -466,6 +467,9 @@ def snapshot():
         "rpc": {"port": int(port), "listening": rpc_listening(host, port),
                 "mem_mb": int(cfg("RPC_MEM_MB", "0") or 0)},
         "llama_ref": cfg("LLAMA_REF", None),
+        "standby": cfg("STANDBY", "0") == "1",
+        "standby_ready": cfg("STANDBY", "0") == "1" and os.path.exists(cfg("LLAMA_BIN", "/opt/llama.cpp/bin") + "/llama-server"),
+        "head_url": _CURRENT.get("url"),
         "uptime_s": uptime,
         "ts": time.time(),
     }
@@ -516,20 +520,52 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+_CURRENT = {"url": None}
+
+
+def load_fallbacks():
+    try:
+        with open(FALLBACK_FILE) as f:
+            return [u for u in json.load(f) if isinstance(u, str)]
+    except (OSError, ValueError):
+        return []
+
+
+def save_fallbacks(urls):
+    try:
+        with open(FALLBACK_FILE, "w") as f:
+            json.dump(urls, f)
+    except OSError:
+        pass
+
+
 def heartbeat_loop():
-    url = cfg("JOIN_URL")
-    if not url and cfg("HEAD"):
-        url = "http://%s:8787" % cfg("HEAD")
-    if not url:
+    """Heartbeat to the primary head; when it is gone, to the standby heads it told us
+    about (in order). Every tick tries the primary first, so service returns to it
+    as soon as it is back."""
+    primary = cfg("JOIN_URL")
+    if not primary and cfg("HEAD"):
+        primary = "http://%s:8787" % cfg("HEAD")
+    if not primary:
         return
-    url = url.rstrip("/") + "/api/heartbeat"
+    primary = primary.rstrip("/")
+    fallbacks = load_fallbacks()
     while True:
-        try:
-            data = json.dumps(snapshot()).encode()
-            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=5).read()
-        except Exception:  # head down, wifi flapping: try again next tick
-            pass
+        body = json.dumps(snapshot()).encode()
+        for url in [primary] + [f for f in fallbacks if f != primary]:
+            try:
+                req = urllib.request.Request(url + "/api/heartbeat", data=body, headers={"Content-Type": "application/json"})
+                resp = json.loads(urllib.request.urlopen(req, timeout=3).read() or b"{}")
+                _CURRENT["url"] = url
+                new = resp.get("fallbacks") or []
+                if url == primary and new != fallbacks:
+                    fallbacks = new
+                    save_fallbacks(fallbacks)
+                break
+            except Exception:
+                continue
+        else:
+            _CURRENT["url"] = None     # nobody answered; keep trying
         time.sleep(HEARTBEAT_S)
 
 

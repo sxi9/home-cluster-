@@ -25,6 +25,14 @@ Owner: sxi9. Design history: docs/SESSION-LOG.md.
   Snapdragon.
 - No external dependencies anywhere: bash + python3 stdlib + one HTML file.
 
+- Dashboard login: pbkdf2 hash + session secret live only in /etc/home-cluster/head.env
+  (never in the repo). Join files stay unauthenticated (devices fetch them).
+  The CLI reaches /api/* from localhost without a session.
+- Failover: a standby runs worker.sh + head.sh --standby PRIMARY; clusterd is
+  installed but stopped; cluster-failover.py promotes/demotes; agents get the
+  standby list in every heartbeat reply and try the primary first each tick.
+  k3s does not fail over (no quorum with two machines).
+
 ## Conventions
 - Every script is idempotent, has `--dry-run` and `--leave`, saves its settings
   (`/etc/home-cluster/*.env`, `$PREFIX/etc/home-cluster/worker.env` on Termux)

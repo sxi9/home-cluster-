@@ -61,6 +61,7 @@ JOIN_URL=http://127.0.0.1:$PORT_D
 DASHBOARD_HTML=$REPO/dashboard/index.html
 EOF2
 cp "$REPO"/worker.sh "$T/join/"; echo "K10token" > "$T/join/token"
+printf 'DASHBOARD_USER=admin\nDASHBOARD_PASS_HASH=%s\nSESSION_SECRET=abc123\n' "$(python3 "$REPO/head/clusterd.py" --hash testpass)" >> "$T/head.env"
 CLUSTER_ENV=$T/head.env python3 "$REPO/head/clusterd.py" & 
 CLUSTER_ENV=$T/head.env python3 "$REPO/agent/cluster-agent.py" &
 sleep 1.5
@@ -73,14 +74,26 @@ curl -fsS "http://127.0.0.1:$PORT_D/worker.sh" | grep -q "^JOIN_URL_DEFAULT=\"ht
 [[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_D/../head.env") == 404 ]] && ok "no path traversal" || fail "traversal"
 [[ $(curl -fsS "http://127.0.0.1:$PORT_D/token") == K10token ]] && ok "token served" || fail "token"
 
+# 1b. login
+[[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_D/") == 302 ]] && ok "dashboard redirects to /login without a session" || fail "login redirect"
+[[ $(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 1.2.3.4' "http://127.0.0.1:$PORT_D/api/nodes") == 200 ]] && ok "localhost CLI bypass for /api" || fail "api bypass"
+curl -fsS "http://127.0.0.1:$PORT_D/login" | grep -q 'name="pass"' && ok "login page renders" || fail "login page"
+[[ $(curl -s -o /dev/null -w '%{http_code}' --data 'user=admin&pass=wrong' "http://127.0.0.1:$PORT_D/login") == 302 ]] && ok "wrong password bounces" || fail "wrong pw"
+curl -s -c "$T/cj" -o /dev/null --data 'user=admin&pass=testpass' "http://127.0.0.1:$PORT_D/login"
+grep -q hc_session "$T/cj" && ok "right password sets a session cookie" || fail "login cookie"
+[[ $(curl -s -b "$T/cj" -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_D/") == 200 ]] && ok "dashboard served with the cookie" || fail "dashboard with cookie"
+curl -fsS "http://127.0.0.1:$PORT_D/api/health" | grep -q '"ok": true' && ok "/api/health open for watchdogs" || fail "health"
+
 # 2. heartbeats
 hb() { curl -fsS -X POST -H 'Content-Type: application/json' -d "$1" "http://127.0.0.1:$PORT_D/api/heartbeat" >/dev/null; }
 hb '{"name":"laptop2","role":"worker","link":"wired","lan_ip":"127.0.0.1","agent_port":1,"mem":{"total_mb":32000,"free_mb":28000},"gpu":{"kind":"vulkan","vram_total_mb":8192,"vram_free_mb":7900},"rpc":{"port":50052,"listening":true,"mem_mb":30000}}'
 hb '{"name":"phone-a","role":"worker","link":"wifi","lan_ip":"127.0.0.1","agent_port":1,"mem":{"total_mb":16000,"free_mb":9800},"gpu":{"kind":"opencl","unified":true},"rpc":{"port":50053,"listening":true,"mem_mb":12000},"temp_c":61}'
 [[ $(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"name":"../x"}' "http://127.0.0.1:$PORT_D/api/heartbeat") == 400 ]] && ok "bad node name rejected" || fail "name validation"
+hb '{"name":"standby1","role":"worker","standby":true,"standby_ready":true,"link":"wired","lan_ip":"127.0.0.1","agent_port":1,"mem":{"total_mb":16000,"free_mb":9000},"gpu":{"kind":"cpu"},"rpc":{"port":50059,"listening":false,"mem_mb":8000}}'
+curl -fsS -X POST -H 'Content-Type: application/json' -d '{"name":"probe","role":"worker","lan_ip":"127.0.0.1","mem":{"total_mb":1,"free_mb":1},"rpc":{"port":1,"listening":false}}' "http://127.0.0.1:$PORT_D/api/heartbeat" | grep -q '"fallbacks": \["http://127.0.0.1:'"$PORT_D"'"\]' && ok "heartbeat reply lists the standby head as fallback" || fail "fallbacks"
 sleep 1
 n=$(curl -fsS "http://127.0.0.1:$PORT_D/api/nodes" | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["awake"]]))')
-[[ $n == 3 ]] && ok "3 awake nodes (head agent + 2 fake workers)" || fail "expected 3 awake nodes, got $n"
+[[ $n == 5 ]] && ok "5 awake nodes (head agent + 4 fake nodes)" || fail "expected 5 awake nodes, got $n"
 
 # 3. plan: wired first, wifi only when needed
 export CLUSTER_ENV=$T/head.env
@@ -92,7 +105,8 @@ grep -q "phone-a" "$T/plan.txt" && ok "wifi phone pulled in because the model ne
 "$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --draft test-24b-q4.gguf | grep -- "-md .*--device-draft Vulkan0" >/dev/null && ok "speculative decoding wired to the head GPU" || fail "draft"
 "$REPO/bin/cluster" models | grep "test-24b-q4.gguf.*48" >/dev/null && ok "cluster models lists the share" || fail "models"
 "$REPO/bin/cluster" tune KV_CACHE_TYPE=q8_0 FLASH_ATTN=on >/dev/null && "$REPO/bin/cluster" plan test-24b-q4.gguf | grep -- "-ctk q8_0 -ctv q8_0" >/dev/null && ok "cluster tune settings reach the llama-server command" || fail "tune"
-"$REPO/bin/cluster" tune KV_CACHE_TYPE=f16 FLASH_ATTN=auto >/dev/null
+"$REPO/bin/cluster" tune --auto | grep -q "KV_CACHE_TYPE=q8_0" && ok "cluster tune --auto explains its choices" || fail "auto tune"
+"$REPO/bin/cluster" tune KV_CACHE_TYPE=f16 FLASH_ATTN=auto THREADS=auto MLOCK=off UBATCH=512 MARGIN_PCT=12 WIFI_MAX_PCT=30 ORDER=bench >/dev/null
 "$REPO/bin/cluster" top | grep -E "^head|cluster-agent|python" >/dev/null && ok "cluster top lists processes" || fail "top"
 
 # 4. run against the fake server

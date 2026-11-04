@@ -5,6 +5,7 @@
 #   sudo ./join.sh head          # this Ubuntu machine becomes the head
 #   sudo ./join.sh worker [...]  # this Ubuntu machine joins as a worker
 #   ./join.sh android [...]      # this Termux phone joins as a worker
+#   sudo ./join.sh standby       # this Ubuntu worker also becomes a fallback head
 #
 # From a checkout it runs the sibling script. Piped from the head
 # (curl -fsSL http://HEAD:8787/join.sh | bash -s worker) it fetches the
@@ -17,8 +18,14 @@ JOIN_URL=${JOIN_URL:-$JOIN_URL_DEFAULT}
 [[ -n $JOIN_URL ]] && export JOIN_URL     # the child script discovers the head from it
 
 role=${1:-}; shift || true
-case $role in head|worker|android) ;; *) sed -n '2,/^set -euo/p' "$0" 2>/dev/null | sed '$d;s/^# \{0,1\}//'; exit 1 ;; esac
+case $role in head|worker|android|standby) ;; *) sed -n '2,/^set -euo/p' "$0" 2>/dev/null | sed '$d;s/^# \{0,1\}//'; exit 1 ;; esac
 script=$role.sh
+if [[ $role == standby ]]; then
+  # a standby is a worker plus head.sh --standby PRIMARY; the primary is the join host
+  [[ -n $JOIN_URL ]] || { echo "join.sh standby: needs the head's join URL (run it via the command head.sh printed)" >&2; exit 1; }
+  primary=$(sed -E 's|^https?://([^:/]+).*|\1|' <<<"$JOIN_URL")
+  exec bash -c 'set -e; "$0" worker "$@"; "$0" head --standby "$1"' "${BASH_SOURCE[0]:-$0}" "$primary"
+fi
 here=""; [[ -f ${BASH_SOURCE[0]:-} ]] && here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ -n $here && -r $here/$script ]]; then
