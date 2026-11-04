@@ -57,6 +57,9 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Dashboard shows the layer split and a tokens/sec number while a request runs
 - [ ] `curl http://HEAD-IP:8080/v1/chat/completions ...` answers
 - [ ] Try `--exclude phone-x` and `--wifi` to see how the split and speed change
+- [ ] `cluster bench` once; the dashboard shows a speed per device and a 🐢 on the slowest
+- [ ] `cluster tune KV_CACHE_TYPE=q8_0` then `cluster plan` shows the flag; try `FLASH_ATTN=on` on GPU devices
+- [ ] `cluster top` shows every device's processes; alerts appear on the dashboard for hogs
 - [ ] `cluster run big.gguf --draft small.gguf` and compare tokens/sec on the dashboard
 - [ ] `cluster ui`, open http://HEAD-IP:30080, create the admin account, chat
 - [ ] `cluster exec --all -- uptime` reaches every Ubuntu and Termux device
@@ -78,5 +81,7 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Ubuntu chroot on a phone (experimental, `android.sh --chroot`)
 - [x] Windows native worker (worker.ps1, untested)
 - [x] Speculative decoding, Open WebUI, one-controller `cluster exec`, `cluster share`
+- [x] `cluster bench` / `cluster tune` / `cluster top` / `cluster kill`, hardware details, network diagram
+- [x] Real RPC split verified in the cloud with llama.cpp master (see README)
 - [ ] Tested worker.ps1 on the Windows laptop
 - [ ] iOS worker app

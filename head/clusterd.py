@@ -50,6 +50,7 @@ JOIN_DIR = cfg("JOIN_DIR", os.path.join(ROOT, "join"))
 STATE_DIR = cfg("STATE_DIR", os.path.join(ROOT, "state"))
 NODES_DIR = os.path.join(STATE_DIR, "nodes")
 RUN_FILE = os.path.join(STATE_DIR, "run.json")
+BENCH_FILE = os.path.join(STATE_DIR, "bench.json")
 HTML = cfg("DASHBOARD_HTML", os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html"))
 LLAMA_URL = cfg("LLAMA_URL", "http://127.0.0.1:%s" % cfg("LLAMA_PORT", "8080"))
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -119,7 +120,7 @@ def state():
     if run and run.get("status") == "running" and llama is None:
         run["status"] = "loading" if run.get("pid") and pid_alive(run["pid"]) else "stopped"
     return {"ts": time.time(), "head": cfg("NODE_NAME", "head"), "nodes": nodes(), "run": run,
-            "llama": llama, "llama_url": "http://%s:%s" % (cfg("HEAD", "head"), cfg("LLAMA_PORT", "8080"))}
+            "llama": llama, "bench": load_json(BENCH_FILE, {}), "llama_url": "http://%s:%s" % (cfg("HEAD", "head"), cfg("LLAMA_PORT", "8080"))}
 
 
 def pid_alive(pid):

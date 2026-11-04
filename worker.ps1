@@ -136,7 +136,8 @@ if ((Test-Path "$Bin\rpc-server.exe") -and (Test-Path $marker) -and ((Get-Conten
       Get-ChildItem "$Bin\_x" -Recurse -File | Move-Item -Destination $Bin -Force
       Remove-Item -Recurse -Force "$Bin\_x"; Remove-Item -Force $zip
     }
-    if (-not (Test-Path "$Bin\rpc-server.exe")) { throw "the release zip has no rpc-server.exe; build llama.cpp with -DGGML_RPC=ON yourself and put rpc-server.exe in $Bin" }
+    if ((Test-Path "$Bin\ggml-rpc-server.exe") -and -not (Test-Path "$Bin\rpc-server.exe")) { Copy-Item "$Bin\ggml-rpc-server.exe" "$Bin\rpc-server.exe" }
+    if (-not (Test-Path "$Bin\rpc-server.exe")) { throw "the release zip has no rpc-server.exe / ggml-rpc-server.exe; build llama.cpp with -DGGML_RPC=ON yourself and put rpc-server.exe in $Bin" }
     Set-Content $marker "$($rel.tag_name):$Gpu"
   }
 }
@@ -194,8 +195,7 @@ Run "write $Root\agent.ps1" { Set-Content -Path "$Root\agent.ps1" -Value $agent 
 
 # ---------------------------------------------------------------- tasks, firewall, power
 Log "scheduled tasks (run at startup as SYSTEM)"
-$memArgs = if ($Gpu -eq "cpu") { "--mem $RpcMemMB" } else { "" }
-$rpcArgs = "--host $LanIp --port $RpcPort --threads $Threads $memArgs"
+$rpcArgs = "--host $LanIp --port $RpcPort --threads $Threads"   # RPC_MEM_MB is a planner-side cap
 Run "register '$TaskRpc': rpc-server.exe $rpcArgs" {
   $a = New-ScheduledTaskAction -Execute "$Bin\rpc-server.exe" -Argument $rpcArgs -WorkingDirectory $Bin
   $t = New-ScheduledTaskTrigger -AtStartup

@@ -12,7 +12,14 @@
   cluster exec NODE|--all -- CMD      run a command on devices over ssh (one controller)
   cluster restart [NODE|--all]        restart rpc-server + agent on devices
   cluster ssh NODE                    interactive shell on a device
+  cluster top [NODE]                  process manager: top processes per device, alerts
+  cluster kill NODE PID               kill a process on a device (over ssh)
   cluster share [--public|off]        dashboard + Open WebUI over Tailscale (or the internet)
+  cluster bench [--model S.gguf] [NODE|--all]
+                                      measure every device: tok/s over RPC, link RTT and
+                                      bandwidth; finds the slowest device; feeds the planner
+  cluster tune [KEY=VALUE ...]        show / set optimization settings (flash attention,
+                                      KV cache type, batch sizes, threads, draft params...)
 
 run/plan options:
   --ctx N            context size (default 8192)
@@ -68,6 +75,40 @@ MODELS = cfg("MODELS_DIR", os.path.join(ROOT, "models"))
 LLAMA_BIN = cfg("LLAMA_BIN", "/opt/llama.cpp/bin")
 CLUSTERD = "http://127.0.0.1:%s" % cfg("CLUSTERD_PORT", "8787")
 RUN_FILE = os.path.join(STATE, "run.json")
+BENCH_FILE = os.path.join(STATE, "bench.json")
+TUNING_FILE = cfg("TUNING_FILE", os.path.join(os.path.dirname(ENV_FILE), "tuning.env"))
+
+# optimization settings: key -> (default, help). `cluster tune` edits them; `cluster run` applies them.
+TUNING = {
+    "CTX":            ("8192",  "default context size"),
+    "FLASH_ATTN":     ("auto",  "on|off|auto  flash attention (faster, less memory on GPU)"),
+    "KV_CACHE_TYPE":  ("f16",   "f16|q8_0|q4_0  KV cache precision; q8_0 halves its memory"),
+    "BATCH":          ("2048",  "logical batch size (-b); prompt processing throughput"),
+    "UBATCH":         ("512",   "physical batch size (-ub); lower if a device runs out of memory"),
+    "THREADS":        ("auto",  "head CPU threads for the layers that stay on the head"),
+    "MLOCK":          ("off",   "on|off  lock the head's model pages in RAM (no swapping)"),
+    "NO_MMAP":        ("off",   "on|off  read the model instead of mmap (helps slow NFS/disks)"),
+    "MARGIN_PCT":     ("12",    "memory kept free on every device for compute buffers"),
+    "WIFI_MAX_PCT":   ("30",    "at most this percent of layers on Wi-Fi devices"),
+    "ORDER":          ("bench", "bench|heuristic  device order: measured speed, or link/gpu heuristic"),
+    "DRAFT_MAX":      ("16",    "speculative decoding: tokens the draft proposes per step"),
+    "DRAFT_MIN":      ("4",     "speculative decoding: minimum draft tokens"),
+    "DRAFT_P_MIN":    ("0.8",   "speculative decoding: min draft probability"),
+}
+
+
+def load_tuning():
+    t = {k: v[0] for k, v in TUNING.items()}
+    t.update({k: v for k, v in read_env(TUNING_FILE).items() if k in TUNING})
+    return t
+
+
+def load_bench():
+    try:
+        with open(BENCH_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 LOG_FILE = os.path.join(LOGS, "llama-server.log")
 
 C = {"b": "\033[1m", "g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "d": "\033[2m", "0": "\033[0m"}
@@ -81,7 +122,9 @@ def die(msg):
 
 
 def gb(mb):
-    return "%.1f GB" % (mb / 1024) if mb is not None else "-"
+    if mb is None:
+        return "-"
+    return "%d MB" % mb if mb < 1024 else "%.1f GB" % (mb / 1024)
 
 
 def get_json(url, timeout=3):
@@ -213,6 +256,13 @@ def worker_devices(only=None, exclude=None, wifi=True, cpu_only=False):
                      "temp_c": n.get("temp_c"), "rpc": "%s:%s" % (n["lan_ip"], n["rpc"]["port"])})
     rank = {"wired": 0, "unknown": 1, "wifi": 2}
     devs.sort(key=lambda d: (rank.get(d["link"], 1), d["gpu"] == "cpu", -d["offered_mb"]))
+    bench = load_bench()
+    if load_tuning()["ORDER"] == "bench" and any(d["node"] in bench for d in devs):
+        # measured speed wins over the heuristic: fastest device first, unmeasured ones last
+        for d in devs:
+            b = bench.get(d["node"]) or {}
+            d["tg_tps"] = b.get("tg_tps")
+        devs.sort(key=lambda d: -(d.get("tg_tps") or 0))
     return devs
 
 
@@ -220,6 +270,7 @@ def worker_devices(only=None, exclude=None, wifi=True, cpu_only=False):
 # planner
 # ---------------------------------------------------------------------------
 def plan(model_path, ctx=8192, margin=12, only=None, exclude=None, head_gpu=True, cpu_only=False, wifi=None):
+    tuning = load_tuning()
     info = read_gguf(model_path)
     if not info["n_layer"]:
         die("could not read block_count from %s" % model_path)
@@ -237,8 +288,12 @@ def plan(model_path, ctx=8192, margin=12, only=None, exclude=None, head_gpu=True
     if wifi or sum(cap(d) for d in wired) < info["n_layer"]:
         order = wired + wifi_devs    # reach for Wi-Fi only when needed, or asked
     assigned, start = [], 0
+    wifi_budget = int(info["n_layer"] * float(tuning["WIFI_MAX_PCT"]) / 100)
     for d in order:
         n = min(cap(d), info["n_layer"] - start)
+        if d["link"] == "wifi":
+            n = min(n, wifi_budget)       # a Wi-Fi device must not hold most of the chain
+            wifi_budget -= max(n, 0)
         if n <= 0:
             continue
         assigned.append({**d, "layers": [start, start + n], "split": n})
@@ -267,7 +322,8 @@ def plan(model_path, ctx=8192, margin=12, only=None, exclude=None, head_gpu=True
         "model": info["name"], "model_path": os.path.abspath(model_path), "arch": info["arch"],
         "size_mb": info["size_mb"], "n_layer": info["n_layer"], "ctx": ctx, "kv_mb": int(kv_mb),
         "per_layer_mb": int(per_layer), "need_mb": int(need_mb), "ngl": ngl, "fits": fits,
-        "devices": assigned, "margin": margin,
+        "devices": assigned, "margin": margin, "tuning": tuning,
+        "bench": {d["node"]: load_bench().get(d["node"]) for d in assigned if load_bench().get(d["node"])},
         "unused": [d["node"] for d in devs if d["node"] not in {a["node"] for a in assigned}],
     }
 
@@ -284,14 +340,62 @@ def print_plan(p):
         print(C["d"] + "  not needed: " + ", ".join(p["unused"]) + C["0"])
     if p.get("draft"):
         print("  speculative decoding with draft model %s on the head" % p["draft"])
+    b = p.get("bench") or {}
+    if b:
+        slow = min(b, key=lambda k: b[k].get("tg_tps") or 1e9)
+        print("  measured: " + ", ".join("%s %.1f tok/s" % (k, v.get("tg_tps") or 0) for k, v in b.items())
+              + C["y"] + "  · bottleneck: %s" % slow + C["0"])
+    t = p.get("tuning") or {}
+    on = [k for k in ("FLASH_ATTN", "KV_CACHE_TYPE", "MLOCK", "NO_MMAP") if t.get(k) not in (None, "off", "auto", "f16")]
+    if on:
+        print("  tuning: " + ", ".join("%s=%s" % (k, t[k]) for k in on))
     if p["ngl"] < p["n_layer"]:
         print(C["y"] + "  %d layer(s) stay on the head's CPU RAM" % (p["n_layer"] - p["ngl"]) + C["0"])
     if not p["fits"]:
         print(C["r"] + "  does not fit: need ~%s, wake more devices or pick a smaller quant" % gb(p["need_mb"]) + C["0"])
 
 
+_HELP = None
+
+
+def server_has(flag):
+    """Does this llama-server know a flag? (names changed across versions)"""
+    global _HELP
+    if _HELP is None:
+        try:
+            r = subprocess.run([os.path.join(LLAMA_BIN, "llama-server"), "--help"], capture_output=True, text=True, timeout=20)
+            _HELP = r.stdout + r.stderr
+        except (OSError, subprocess.SubprocessError):
+            _HELP = ""
+    return flag in _HELP
+
+
+def rpc_device_names(rpc_list):
+    """host:port -> device name as this llama-server calls it (RPC0.. on current builds,
+    RPC[host:port] on older ones). Asks --list-devices with the same --rpc list."""
+    names = {}
+    exe = os.path.join(LLAMA_BIN, "llama-server")
+    try:
+        r = subprocess.run([exe, "--rpc", ",".join(rpc_list), "--list-devices"], capture_output=True, text=True, timeout=30)
+        for m in re.finditer(r"^\s+(\S+):\s+(.*?)\s+\(\d+\s+MiB", r.stdout + r.stderr, re.M):
+            name, desc = m.groups()
+            if desc in rpc_list:
+                names[desc] = name
+            elif name.startswith("RPC[") and name[4:-1] in rpc_list:
+                names[name[4:-1]] = name
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for i, hp in enumerate(rpc_list):
+        names.setdefault(hp, "RPC%d" % i)
+    return names
+
+
 def build_cmd(p, port, extra):
-    rpc = [d for d in p["devices"] if d["device"].startswith("RPC[")]
+    rpc = [d for d in p["devices"] if d.get("rpc")]
+    if rpc:
+        names = rpc_device_names([d["rpc"] for d in rpc])
+        for d in rpc:
+            d["device"] = names[d["rpc"]]
     devs = [d["device"] for d in p["devices"] if d["device"] != "CPU"]
     cmd = [os.path.join(LLAMA_BIN, "llama-server"), "-m", p["model_path"], "--host", "0.0.0.0", "--port", str(port),
            "--metrics", "-c", str(p["ctx"]), "-ngl", str(p["ngl"]), "--alias", p["model"]]
@@ -301,10 +405,30 @@ def build_cmd(p, port, extra):
         cmd += ["--device", ",".join(devs)]
     if len(devs) > 1:
         cmd += ["--tensor-split", ",".join(str(d["split"]) for d in p["devices"] if d["device"] != "CPU")]
+    t = p.get("tuning") or load_tuning()
+    if t["FLASH_ATTN"] in ("on", "off"):
+        cmd += ["-fa", t["FLASH_ATTN"]]
+    if t["KV_CACHE_TYPE"] != "f16":
+        cmd += ["-ctk", t["KV_CACHE_TYPE"], "-ctv", t["KV_CACHE_TYPE"]]
+    cmd += ["-b", t["BATCH"], "-ub", t["UBATCH"]]
+    if t["THREADS"] != "auto":
+        cmd += ["-t", t["THREADS"]]
+    if server_has("--load-mode"):
+        if t["MLOCK"] == "on":
+            cmd += ["--load-mode", "mlock"]
+        elif t["NO_MMAP"] == "on":
+            cmd += ["--load-mode", "none"]
+    else:
+        if t["MLOCK"] == "on":
+            cmd += ["--mlock"]
+        if t["NO_MMAP"] == "on":
+            cmd += ["--no-mmap"]
     if p.get("draft_path"):
         # the draft model stays entirely on the head: its whole point is to avoid the network
         head_gpu = [d["device"] for d in p["devices"] if d["link"] == "local" and d["device"] != "CPU"]
-        cmd += ["-md", p["draft_path"], "--draft-max", "16", "--draft-min", "4", "--draft-p-min", "0.8"]
+        new = server_has("--spec-draft-n-max")
+        cmd += ["-md", p["draft_path"], "--spec-draft-n-max" if new else "--draft-max", t["DRAFT_MAX"],
+                "--spec-draft-n-min" if new else "--draft-min", t["DRAFT_MIN"], "--draft-p-min", t["DRAFT_P_MIN"]]
         cmd += ["-ngld", "999", "--device-draft", head_gpu[0]] if head_gpu else ["-ngld", "0"]
     return cmd + list(extra)
 
@@ -337,8 +461,9 @@ def alive(pid):
 
 
 def cmd_run(args, dry=False):
-    opts = {"ctx": 8192, "port": int(cfg("LLAMA_PORT", "8080")), "only": None, "exclude": None,
-            "head_gpu": True, "cpu_only": False, "margin": 12, "wifi": None, "draft": None}
+    tuning = load_tuning()
+    opts = {"ctx": int(tuning["CTX"]), "port": int(cfg("LLAMA_PORT", "8080")), "only": None, "exclude": None,
+            "head_gpu": True, "cpu_only": False, "margin": float(tuning["MARGIN_PCT"]), "wifi": None, "draft": None}
     extra, model = [], None
     it = iter(args)
     for a in it:
@@ -392,6 +517,12 @@ def cmd_run(args, dry=False):
     old = load_run()
     if old and old.get("pid") and alive(old["pid"]):
         die("a run is already active (pid %d): cluster stop first" % old["pid"])
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", opts["port"]), timeout=1):
+            die("port %d is already in use by something else; stop it or use --port" % opts["port"])
+    except OSError:
+        pass
     os.makedirs(LOGS, exist_ok=True)
     log = open(LOG_FILE, "wb")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -423,6 +554,11 @@ def cmd_run(args, dry=False):
     m = re.search(r"offloaded (\d+)/(\d+) layers", text)
     if m:
         run["offloaded"] = [int(m.group(1)), int(m.group(2))]
+    for d in run["devices"]:
+        if d.get("buffer_mb") is None and d.get("layers"):
+            # current llama-server does not log per-device buffer sizes at default verbosity
+            d["buffer_mb"] = int((d["layers"][1] - d["layers"][0]) * run["per_layer_mb"])
+            d["buffer_estimated"] = True
     run["status"] = "running"
     save_run(run)
     print(C["g"] + "running" + C["0"] + "  http://%s:%d  (OpenAI-compatible: /v1/chat/completions)" % (cfg("HEAD", "head"), opts["port"]))
@@ -589,6 +725,168 @@ def cmd_share(args):
     print("Open WebUI: https://%s        (%s)" % (name, "PUBLIC via Tailscale Funnel" if public else "tailnet only"))
 
 
+def cmd_tune(args):
+    t = load_tuning()
+    if args:
+        for a in args:
+            if "=" not in a:
+                die("usage: cluster tune KEY=VALUE ...")
+            k, v = a.split("=", 1)
+            k = k.upper()
+            if k not in TUNING:
+                die("unknown setting %s (cluster tune lists them)" % k)
+            t[k] = v
+        os.makedirs(os.path.dirname(TUNING_FILE), exist_ok=True)
+        with open(TUNING_FILE, "w") as f:
+            f.write("# home-cluster tuning — edit with `cluster tune KEY=VALUE`; applied by `cluster run`\n")
+            for k in TUNING:
+                f.write("%s=%s\n" % (k, t[k]))
+        print("saved to %s (takes effect on the next cluster run)" % TUNING_FILE)
+    print("  %-15s %-8s %s" % ("setting", "value", "meaning"))
+    for k, (d, h) in TUNING.items():
+        mark = "" if t[k] == d else C["y"] + " *" + C["0"]
+        print("  %-15s %-8s %s%s" % (k, t[k], h, mark))
+
+
+def probe_link(n, mb=8):
+    """RTT to the rpc port and upload bandwidth to the agent, from the head."""
+    import socket
+    host, port = n.get("lan_ip"), (n.get("rpc") or {}).get("port")
+    rtts = []
+    for _ in range(3):
+        t0 = time.time()
+        try:
+            with socket.create_connection((host, int(port)), timeout=2):
+                rtts.append((time.time() - t0) * 1000)
+        except (OSError, ValueError, TypeError):
+            pass
+    out = {"rtt_ms": round(min(rtts), 2) if rtts else None, "bw_mbps": None}
+    if n.get("agent_port"):
+        data = b"\0" * (mb << 20)
+        t0 = time.time()
+        try:
+            req = urllib.request.Request("http://%s:%s/sink" % (host, n["agent_port"]), data=data,
+                                         headers={"Content-Type": "application/octet-stream"})
+            urllib.request.urlopen(req, timeout=30).read()
+            out["bw_mbps"] = round(mb * 8 / (time.time() - t0), 1)
+        except Exception:
+            pass
+    return out
+
+
+def bench_device(model, rpc=None, ngl=99):
+    """tok/s with the whole small model on one device (over RPC when rpc is given)."""
+    exe = os.path.join(LLAMA_BIN, "llama-bench")
+    cmd = [exe, "-m", model, "-ngl", str(ngl), "-p", "128", "-n", "32", "-r", "2", "-o", "json"]
+    if rpc:
+        cmd += ["--rpc", rpc]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        rows = json.loads(r.stdout[r.stdout.index("["):])
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    out = {}
+    for row in rows:
+        if row.get("n_prompt"):
+            out["pp_tps"] = round(row.get("avg_ts", 0), 1)
+        if row.get("n_gen"):
+            out["tg_tps"] = round(row.get("avg_ts", 0), 1)
+    return out
+
+
+def cmd_bench(args):
+    model, sel = None, "--all"
+    it = iter(args)
+    for a in it:
+        if a == "--model":
+            model = next(it)
+        else:
+            sel = a
+    if not model:
+        ggufs = sorted((os.path.getsize(os.path.join(MODELS, f)), f) for f in os.listdir(MODELS) if f.endswith(".gguf")) if os.path.isdir(MODELS) else []
+        if not ggufs:
+            die("no model: put a small GGUF (0.5B-1B) in %s or pass --model" % MODELS)
+        model = os.path.join(MODELS, ggufs[0][1])
+        if ggufs[0][0] > 3 * 2**30:
+            print(C["y"] + "benchmarking with a %s model is slow; a 0.5B-1B GGUF is enough" % gb(ggufs[0][0] >> 20) + C["0"])
+    elif not os.path.exists(model) and os.path.exists(os.path.join(MODELS, model)):
+        model = os.path.join(MODELS, model)
+    nodes = get_json(CLUSTERD + "/api/nodes")
+    bench = load_bench()
+    targets = [n for n in nodes if n.get("awake") and (sel == "--all" or n["name"] == sel)]
+    if not targets:
+        die("nothing awake to benchmark")
+    print("benchmark model: %s" % os.path.basename(model))
+    print("  %-18s %-8s %-10s %-10s %-9s %-10s" % ("node", "link", "gen tok/s", "prompt t/s", "rtt ms", "bw Mbit/s"))
+    for n in targets:
+        name = n["name"]
+        if n.get("role") == "head":
+            res = bench_device(model, None, 99 if cfg("GPU", "cpu") != "cpu" else 0)
+            link = {"rtt_ms": 0, "bw_mbps": None}
+        else:
+            if not (n.get("rpc") or {}).get("listening"):
+                print("  %-18s rpc down, skipped" % name)
+                continue
+            link = probe_link(n)
+            res = bench_device(model, "%s:%s" % (n["lan_ip"], n["rpc"]["port"]))
+        entry = {**res, **link, "ts": time.time(), "model": os.path.basename(model), "link": n.get("link"), "gpu": (n.get("gpu") or {}).get("kind")}
+        bench[name] = entry
+        save_json_file(BENCH_FILE, bench)
+        print("  %-18s %-8s %-10s %-10s %-9s %-10s %s" % (name, n.get("link"), entry.get("tg_tps", "-"), entry.get("pp_tps", "-"),
+              entry.get("rtt_ms", "-"), entry.get("bw_mbps") or "-", C["r"] + entry["error"] + C["0"] if entry.get("error") else ""))
+    measured = {k: v for k, v in bench.items() if v.get("tg_tps")}
+    if len(measured) > 1:
+        slow = min(measured, key=lambda k: measured[k]["tg_tps"])
+        fast = max(measured, key=lambda k: measured[k]["tg_tps"])
+        print(C["y"] + "slowest: %s (%.1f tok/s)" % (slow, measured[slow]["tg_tps"]) + C["0"] +
+              "  fastest: %s (%.1f tok/s)" % (fast, measured[fast]["tg_tps"]))
+        print("  the chain runs at the pace of its slowest device; the planner now orders devices by these numbers (ORDER=bench)")
+
+
+def save_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def cmd_top(args):
+    nodes = get_json(CLUSTERD + "/api/nodes")
+    sel = args[0] if args else None
+    for n in nodes:
+        if sel and n["name"] != sel:
+            continue
+        procs = n.get("processes") or []
+        if n.get("agent_port") and n.get("awake"):
+            try:
+                procs = get_json("http://%s:%s/processes" % (n["lan_ip"], n["agent_port"]), timeout=3)[:12 if sel else 6]
+            except Exception:
+                pass
+        print(C["b"] + n["name"] + C["0"] + "  %s · %s free of %s · load %s%s" % (
+            "awake" if n.get("awake") else "asleep", gb((n.get("mem") or {}).get("free_mb")), gb((n.get("mem") or {}).get("total_mb")),
+            n.get("load1"), ("  " + C["y"] + "⚠ " + "; ".join(n["alerts"]) + C["0"]) if n.get("alerts") else ""))
+        if not procs:
+            print("  (no process data: heartbeat-only agent)")
+            continue
+        print("  %-7s %-24s %10s %7s" % ("pid", "process", "rss", "cpu%"))
+        for p in procs:
+            tag = C["d"] if p.get("cluster") else ""
+            print("  %s%-7d %-24s %10s %7s%s" % (tag, p["pid"], p["name"], gb(p["rss_mb"]), p["cpu_pct"] if p.get("cpu_pct") is not None else "-", C["0"] if tag else ""))
+    if not sel:
+        print(C["d"] + "cluster top NODE for more; cluster kill NODE PID; cluster ssh NODE for a shell" + C["0"])
+
+
+def cmd_kill(args):
+    if len(args) != 2 or not args[1].isdigit():
+        die("usage: cluster kill NODE PID")
+    n = pick_nodes(args[0])[0]
+    c = ssh_cmd(n, "kill %s" % args[1])
+    if not c:
+        die("%s is not reachable over ssh" % n["name"])
+    r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+    print("killed" if r.returncode == 0 else "failed: " + (r.stderr.strip() or r.stdout.strip()))
+
+
 def cmd_models():
     try:
         nodes = get_json(CLUSTERD + "/api/nodes")
@@ -649,8 +947,16 @@ def main(argv):
         cmd_restart(args)
     elif cmd == "ssh":
         cmd_ssh(args)
+    elif cmd == "top":
+        cmd_top(args)
+    elif cmd == "kill":
+        cmd_kill(args)
     elif cmd == "share":
         cmd_share(args)
+    elif cmd == "bench":
+        cmd_bench(args)
+    elif cmd == "tune":
+        cmd_tune(args)
     elif cmd == "models":
         cmd_models()
     elif cmd == "logs":
@@ -660,4 +966,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # `cluster ... | head` must not traceback
     main(sys.argv[1:])

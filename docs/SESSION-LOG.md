@@ -34,6 +34,14 @@ from one place; maybe public access.
     one controller (`cluster exec/restart/ssh` over the head's ssh key),
     remote access via Tailscale Serve/Funnel (`cluster share`).
 
+13. Per-device speed (`cluster bench`), optimization settings (`cluster tune`),
+    process manager (`cluster top/kill`, dashboard panel with ssh hints),
+    processor + storage details (NVMe/SSD/HDD/eMMC/UFS/SD card with vendor),
+    network diagram (docs/network.md).
+14. Real cloud test: built llama.cpp master, ran two real rpc-servers and a
+    real 0.5B model split across them; found and fixed five version drifts in
+    the scripts (see CLAUDE.md). No phones or laptops were involved yet.
+
 ## Research notes (partial; the search batch was interrupted)
 - prima.cpp (ICLR 2026) targets heterogeneous low-resource home clusters, runs
   on Linux/macOS/Android, claims 5–17× lower latency than llama.cpp/exo/dllama.

@@ -87,19 +87,22 @@ export CLUSTER_ENV=$T/head.env
 "$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 | tee "$T/plan.txt"
 grep -q "laptop2 *wired" "$T/plan.txt" && ok "wired worker in plan" || fail "laptop2 missing from plan"
 grep -q "phone-a" "$T/plan.txt" && ok "wifi phone pulled in because the model needs it" || fail "phone-a missing"
-"$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --exclude phone-a | grep -q "stay on the head" && ok "--exclude honoured, remainder on head CPU" || fail "exclude"
+"$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --exclude phone-a | grep "stay on the head" >/dev/null && ok "--exclude honoured, remainder on head CPU" || fail "exclude"
 
-"$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --draft test-24b-q4.gguf | grep -q -- "-md .*--device-draft Vulkan0" && ok "speculative decoding wired to the head GPU" || fail "draft"
-"$REPO/bin/cluster" models | grep -q "test-24b-q4.gguf.*48" && ok "cluster models lists the share" || fail "models"
+"$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --draft test-24b-q4.gguf | grep -- "-md .*--device-draft Vulkan0" >/dev/null && ok "speculative decoding wired to the head GPU" || fail "draft"
+"$REPO/bin/cluster" models | grep "test-24b-q4.gguf.*48" >/dev/null && ok "cluster models lists the share" || fail "models"
+"$REPO/bin/cluster" tune KV_CACHE_TYPE=q8_0 FLASH_ATTN=on >/dev/null && "$REPO/bin/cluster" plan test-24b-q4.gguf | grep -- "-ctk q8_0 -ctv q8_0" >/dev/null && ok "cluster tune settings reach the llama-server command" || fail "tune"
+"$REPO/bin/cluster" tune KV_CACHE_TYPE=f16 FLASH_ATTN=auto >/dev/null
+"$REPO/bin/cluster" top | grep -E "^head|cluster-agent|python" >/dev/null && ok "cluster top lists processes" || fail "top"
 
 # 4. run against the fake server
-"$REPO/bin/cluster" run test-24b-q4.gguf --ctx 4096 | grep -q "^running" && ok "cluster run reached running" || fail "run"
+"$REPO/bin/cluster" run test-24b-q4.gguf --ctx 4096 | grep "^running" >/dev/null && ok "cluster run reached running" || fail "run"
 st=$(curl -fsS "http://127.0.0.1:$PORT_D/api/state")
 python3 - "$st" <<'PY' && ok "api/state has run + throughput + buffers" || fail "api/state"
 import json,sys; s=json.loads(sys.argv[1]); r=s["run"]
 assert r["status"]=="running" and s["llama"]["gen_tps"]==4.2, s["llama"]
 assert any(d.get("buffer_mb")==2048 for d in r["devices"]), r["devices"]
 PY
-"$REPO/bin/cluster" status | grep -q "4.2 tok/s" && ok "cluster status shows throughput" || fail "status"
-"$REPO/bin/cluster" stop | grep -q stopped && ok "cluster stop" || fail "stop"
+"$REPO/bin/cluster" status | grep "4.2 tok/s" >/dev/null && ok "cluster status shows throughput" || fail "status"
+"$REPO/bin/cluster" stop | grep stopped >/dev/null && ok "cluster stop" || fail "stop"
 echo "smoke test passed"

@@ -167,12 +167,51 @@ def gpu():
     return info
 
 
+def port_listening(port):
+    """Is anything LISTENing on this TCP port? Read from the kernel socket table, so the
+    check does not open a connection (rpc-server serves one client at a time and a probe
+    connection would otherwise sit in its backlog mid-run)."""
+    want = "%04X" % int(port)
+    found = False
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 3 and parts[1].rsplit(":", 1)[1] == want and parts[3] == "0A":
+                        return True
+                found = True
+        except (OSError, StopIteration, IndexError, ValueError):
+            continue
+    return False if found else None   # None: table not readable (Android 10+ for non-root apps)
+
+
 def rpc_listening(host, port):
+    state = port_listening(port)
+    if state is not None:
+        return state
     try:
         with socket.create_connection((host, int(port)), timeout=0.5):
             return True
     except (OSError, ValueError):
-        return False
+        # could not connect: busy serving the current run, or really down
+        return any(n.startswith(("rpc-server", "ggml-rpc-server")) for n in process_names())
+
+
+def process_names():
+    out = []
+    try:
+        for pid in os.listdir("/proc"):
+            if pid.isdigit():
+                try:
+                    with open("/proc/%s/comm" % pid) as f:
+                        out.append(f.read().strip())
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
 
 
 def is_android():
@@ -191,6 +230,205 @@ def device_model():
         except OSError:
             pass
     return platform.node()
+
+
+# JEDEC manufacturer ids for MMC/SD (eMMC chips and SD cards)
+MMC_VENDORS = {0x02: "Kingston/Toshiba", 0x03: "SanDisk", 0x11: "Toshiba/Kioxia", 0x13: "Micron", 0x15: "Samsung",
+               0x1b: "Samsung", 0x27: "Phison", 0x28: "Lexar", 0x45: "SanDisk", 0x70: "Kingston", 0x74: "Transcend",
+               0x90: "SK Hynix", 0xfe: "Micron", 0x9f: "Kingston", 0x82: "Sony", 0x41: "Kingston"}
+
+
+def read_str(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def cpu_info():
+    model = ""
+    if is_android():
+        soc = sh(["getprop", "ro.soc.model"])
+        manu = sh(["getprop", "ro.soc.manufacturer"])
+        model = " ".join(x for x in (manu, soc) if x) or sh(["getprop", "ro.hardware"])
+    if not model:
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith(("model name", "hardware")):
+                        model = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    mhz = read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    # big.LITTLE phones: report the fastest cluster
+    try:
+        for c in os.listdir("/sys/devices/system/cpu"):
+            if c.startswith("cpu") and c[3:].isdigit():
+                m = read_int("/sys/devices/system/cpu/%s/cpufreq/cpuinfo_max_freq" % c)
+                if m and (mhz is None or m > mhz):
+                    mhz = m
+    except OSError:
+        pass
+    return {"model": model or platform.processor() or platform.machine(), "cores": os.cpu_count(),
+            "max_mhz": mhz // 1000 if mhz else None, "arch": platform.machine()}
+
+
+def mounts():
+    """device -> (mountpoint, fstype) from /proc/mounts, first mount wins."""
+    out = {}
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                dev, mp, fs = line.split()[:3]
+                out.setdefault(os.path.realpath(dev) if dev.startswith("/dev/") else dev, (mp, fs))
+    except OSError:
+        pass
+    return out
+
+
+def free_gb(path):
+    try:
+        st = os.statvfs(path)
+        return round(st.f_bavail * st.f_frsize / 2**30, 1)
+    except OSError:
+        return None
+
+
+def storage_info():
+    """Every physical block device: kind (NVMe SSD / SSD / HDD / eMMC / UFS / SD card), vendor, model, size, free."""
+    out = []
+    mts = mounts()
+    try:
+        blocks = sorted(os.listdir("/sys/block"))
+    except OSError:
+        return out
+    for b in blocks:
+        if b.startswith(("loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd")):
+            continue
+        base = "/sys/block/" + b
+        size = read_int(base + "/size")
+        if not size or size * 512 < 2**30:
+            continue
+        dev = base + "/device"
+        link = os.path.realpath(dev) if os.path.exists(dev) else ""
+        rot = read_int(base + "/queue/rotational")
+        vendor = read_str(dev + "/vendor")
+        if vendor.startswith("0x"):
+            vendor = {"0x1af4": "virtio", "0x144d": "Samsung", "0x15b7": "SanDisk/WD", "0x1c5c": "SK Hynix", "0x1e0f": "Kioxia", "0x8086": "Intel", "0xc0a9": "Micron/Crucial", "0x1987": "Phison", "0x126f": "Silicon Motion"}.get(vendor.lower(), vendor)
+        model = read_str(dev + "/model") or read_str(dev + "/name")
+        kind = "disk"
+        if b.startswith("nvme"):
+            kind = "NVMe SSD"
+            vendor = vendor or ""
+        elif b.startswith("mmcblk"):
+            t = read_str(dev + "/type").upper()
+            kind = {"MMC": "eMMC", "SD": "SD card", "SDIO": "SDIO"}.get(t, "MMC")
+            manf = read_str(dev + "/manfid")
+            try:
+                vendor = MMC_VENDORS.get(int(manf, 16), vendor or manf)
+            except ValueError:
+                pass
+            if not model:
+                model = read_str(dev + "/name")
+        elif "ufs" in link.lower() or "ufshc" in link.lower():
+            kind = "UFS"
+        elif b.startswith(("sd", "vd", "xvd")):
+            kind = "HDD" if rot == 1 else "SSD"
+            if "usb" in link.lower():
+                kind += " (USB)"
+        # find a mount on this device or one of its partitions
+        mp = None
+        for d, (m, fs) in mts.items():
+            if d.startswith("/dev/" + b):
+                if mp is None or m in ("/", "/data"):
+                    mp = m
+        entry = {"dev": b, "kind": kind, "vendor": vendor.strip(), "model": model.strip(),
+                 "size_gb": round(size * 512 / 2**30, 1), "mount": mp, "free_gb": free_gb(mp) if mp else None}
+        out.append(entry)
+    if is_android():
+        # user storage lives on /data; external cards show up under /storage/XXXX-XXXX
+        if out and all(e["free_gb"] is None for e in out):
+            out[0]["mount"], out[0]["free_gb"] = "/data", free_gb("/data")
+        try:
+            for d in os.listdir("/storage"):
+                if d not in ("emulated", "self") and os.path.ismount("/storage/" + d):
+                    card = next((e for e in out if e["kind"] == "SD card"), None)
+                    if card:
+                        card["mount"], card["free_gb"] = "/storage/" + d, free_gb("/storage/" + d)
+                    else:
+                        st = os.statvfs("/storage/" + d)
+                        out.append({"dev": d, "kind": "SD card", "vendor": "", "model": "", "mount": "/storage/" + d,
+                                    "size_gb": round(st.f_blocks * st.f_frsize / 2**30, 1), "free_gb": free_gb("/storage/" + d)})
+        except OSError:
+            pass
+    return out
+
+
+_LAST_PROC = {}      # pid -> (cpu_ticks, wall)
+CLUSTER_PROCS = ("rpc-server", "ggml-rpc-server", "llama-server", "cluster-agent", "clusterd", "k3s", "containerd")
+
+
+def processes(limit=8):
+    """Top processes by memory, with CPU% since the last call. /proc only, no psutil."""
+    global _LAST_PROC
+    hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    now = time.time()
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    seen, out = {}, []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        try:
+            with open("/proc/%s/stat" % pid) as f:
+                st = f.read()
+            name = st[st.index("(") + 1:st.rindex(")")]
+            fields = st[st.rindex(")") + 2:].split()
+            ticks = int(fields[11]) + int(fields[12])          # utime + stime
+            rss_mb = int(fields[21]) * page // 2**20
+        except (OSError, ValueError, IndexError):
+            continue
+        if rss_mb < 8:
+            continue
+        cpu = None
+        last = _LAST_PROC.get(pid)
+        if last:
+            dt = now - last[1]
+            if dt > 0:
+                cpu = round(100.0 * (ticks - last[0]) / hz / dt, 1)
+        seen[pid] = (ticks, now)
+        out.append({"pid": int(pid), "name": name[:24], "rss_mb": rss_mb, "cpu_pct": cpu,
+                    "cluster": any(name.startswith(c) for c in CLUSTER_PROCS)})
+    _LAST_PROC = seen
+    out.sort(key=lambda p: -p["rss_mb"])
+    return out[:limit]
+
+
+def alerts(procs, mem):
+    """Things a person would want to know: a non-cluster process hogging RAM or CPU."""
+    out = []
+    total = mem.get("total_mb") or 1
+    for p in procs:
+        if p["cluster"]:
+            continue
+        if p["rss_mb"] > total * 0.25:
+            out.append("%s uses %d MB RAM (%d%%)" % (p["name"], p["rss_mb"], 100 * p["rss_mb"] // total))
+        elif (p["cpu_pct"] or 0) > 80:
+            out.append("%s uses %d%% CPU" % (p["name"], p["cpu_pct"]))
+    if mem.get("total_mb") and mem.get("free_mb") is not None and mem["free_mb"] < total * 0.08:
+        out.append("low memory: %d MB free" % mem["free_mb"])
+    return out[:4]
+
+
+def ssh_hint():
+    if is_android():
+        return {"user": "termux", "port": 8022}
+    if platform.system().lower() == "linux":
+        return {"user": "root", "port": 22}
+    return None
 
 
 def snapshot():
@@ -215,8 +453,13 @@ def snapshot():
         "lan_ip": host,
         "agent_port": int(cfg("AGENT_PORT", "8788")),
         "cpus": os.cpu_count(),
+        "cpu": cpu_info(),
+        "storage": storage_info(),
+        "processes": (procs := processes()),
+        "alerts": alerts(procs, (m := meminfo())),
+        "ssh": ssh_hint(),
         "load1": load1,
-        "mem": meminfo(),
+        "mem": m,
         "gpu": gpu(),
         "temp_c": temperature_c(),
         "battery": battery(),
@@ -230,12 +473,40 @@ def snapshot():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.split("?")[0] in ("/", "/metrics", "/health"):
+        path = self.path.split("?")[0]
+        if path == "/processes":
+            body = json.dumps(processes(limit=25)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path in ("/", "/metrics", "/health"):
             body = json.dumps(snapshot()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        # bandwidth probe from the head: body is discarded, byte count returned
+        if self.path.split("?")[0] == "/sink":
+            n = int(self.headers.get("Content-Length", "0"))
+            left = n
+            while left > 0:
+                chunk = self.rfile.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                left -= len(chunk)
+            body = json.dumps({"bytes": n - left}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
         else:

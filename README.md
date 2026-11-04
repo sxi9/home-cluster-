@@ -3,7 +3,7 @@
 [![ci](https://github.com/sxi9/home-cluster-/actions/workflows/ci.yml/badge.svg)](https://github.com/sxi9/home-cluster-/actions/workflows/ci.yml)
 ![platforms](https://img.shields.io/badge/devices-Ubuntu%20%C2%B7%20Android%20(Termux)-blue)
 ![gpu](https://img.shields.io/badge/GPU-Vulkan%20%C2%B7%20CUDA%20%C2%B7%20ROCm%20%C2%B7%20Adreno%20OpenCL-green)
-![status](https://img.shields.io/badge/status-not%20yet%20run%20on%20real%20hardware-orange)
+![status](https://img.shields.io/badge/status-real%20RPC%20split%20verified%20in%20the%20cloud%20%C2%B7%20laptops%20%26%20phones%20untested-yellow)
 
 Pool the RAM, GPUs and CPUs of the laptops and phones you already own into one
 cluster, run a language model that is too big for any single device, and watch
@@ -93,6 +93,19 @@ cluster ui                                # Open WebUI on k3s at http://HEAD-IP:
 cluster models                            # what is in the share and whether it fits right now
 ```
 
+**4b. Measure, then tune.** Every device is only as useful as its speed and its link:
+
+```bash
+cluster bench                 # tok/s of each device over RPC, link RTT and bandwidth; flags the slowest
+cluster tune                  # show optimization settings and what they do
+cluster tune KV_CACHE_TYPE=q8_0 FLASH_ATTN=on WIFI_MAX_PCT=20
+cluster top                   # process manager: what is eating RAM/CPU on every device, with alerts
+cluster kill phone-b 2990     # kill a process on a device
+```
+
+After `cluster bench`, the planner orders devices by measured speed instead of
+the wired/GPU heuristic, and the dashboard marks the slowest device with 🐢.
+
 **5. One controller for every device**, from the head:
 
 ```bash
@@ -131,11 +144,40 @@ dependencies, works offline on the LAN and over Tailscale.
 - Tokens per second for generation and prompt processing, with a two-minute
   sparkline. The numbers come from `llama-server`'s own metrics endpoint.
 - Warnings when a phone runs hot or its battery is low and not charging.
+- Measured speed per device (tokens/sec over RPC, link RTT and bandwidth) with
+  the slowest device flagged, since the chain runs at its pace.
+- Processor and every storage device with its kind (NVMe, SSD, HDD, eMMC, UFS,
+  SD card), vendor, size and free space, including SD cards in phones.
+- A process panel per device: top processes by memory with CPU%, alerts when a
+  non-cluster process hogs RAM or CPU, and the exact `cluster ssh` / `cluster kill`
+  commands for that device.
 
 <details><summary>Phone-sized view</summary>
 
 ![phone](docs/screenshots/dashboard-phone.png)
 </details>
+
+## Real test in the cloud
+
+The whole model path was run for real in this project's build container (no
+systemd, no GPU, so the service scripts were dry-run only): llama.cpp was
+built from master, two real `rpc-server` processes acted as workers, and a real
+Qwen2.5 0.5B model was split 11 + 11 + 2 layers across them and the head.
+
+![real run](docs/screenshots/real-run-cloud.png)
+
+| what | result |
+|---|---|
+| `cluster bench` | head 103.7 tok/s, each rpc worker ~26 tok/s over RPC; slowest flagged |
+| `cluster run` | planner split 11/11/2, `llama-server` started with `--rpc` + `--device RPC0,RPC1` + `--tensor-split` |
+| chat completion | real answer through both workers at 16.9 tok/s (bigger, not faster: 103.7 on the head alone) |
+| dashboard | live tok/s from llama-server metrics, layer bar, speed, processes, hardware |
+
+Bugs the real binaries caught, all fixed: the rpc-server binary was renamed to
+`ggml-rpc-server`, `--mem` was removed from it, RPC devices are now named
+`RPC0, RPC1…`, the speculative flags became `--spec-draft-n-max/min`, and the
+default build is shared libraries (the scripts now build static). See
+[docs/network.md](docs/network.md) for how the devices connect.
 
 ## What is in the repo
 
@@ -147,11 +189,12 @@ dependencies, works offline on the LAN and over Tailscale.
 | `android.sh` | Termux phones | rpc-server build (Adreno OpenCL or CPU), termux-services, boot start, sshd, root tweaks |
 | `worker.ps1` | Windows PCs | native worker: prebuilt llama.cpp release, startup tasks, heartbeat agent; model pool only |
 | `k8s/open-webui.yaml` | head (k3s) | Open WebUI deployment applied by `cluster ui` |
-| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `ui`, `exec`, `restart`, `ssh`, `share` |
+| `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `bench`, `tune`, `top`, `kill`, `ui`, `exec`, `restart`, `ssh`, `share` |
 | `head/clusterd.py` | head | one service: join files, heartbeats, `/api/state`, the dashboard |
 | `dashboard/index.html` | head | the dashboard page |
 | `agent/cluster-agent.py` | every node | `/metrics` endpoint + heartbeat; standard library only |
 | `tests/smoke.sh` | dev | end-to-end test with fake nodes and a fake llama-server; runs in CI |
+| `docs/network.md` | you | diagram of how the devices connect, what travels where, every port |
 | `CHECKLIST.md` | you | per-device setup checklist and build progress |
 | `CLAUDE.md`, `docs/SESSION-LOG.md` | you + Claude | project memory: decisions, conventions, the design conversation |
 | `docs/` | you | GPU and phone details, troubleshooting |
@@ -188,10 +231,10 @@ far too chatty for the internet. Tailscale gives you the dashboard, the API,
 
 ## Honest status
 
-- Nothing here has been run on real hardware yet. Every script passed
-  shellcheck and a full `--dry-run`, and the Python parts pass an end-to-end
-  smoke test against fake nodes and a fake `llama-server`. The first real test
-  is the two laptops; see [CHECKLIST.md](CHECKLIST.md).
+- The model path (rpc-server, planner, llama-server, dashboard metrics) was
+  verified for real in the cloud, see above. The install scripts have only
+  been dry-run: systemd units, k3s, NFS, Tailscale and the phone build need the
+  real laptops and a phone. See [CHECKLIST.md](CHECKLIST.md).
 - Phones join the model pool and the dashboard, but not k3s. Stock Android
   kernels lack what k3s needs. `android.sh --chroot` sets up an Ubuntu chroot
   for experiments, nothing more.

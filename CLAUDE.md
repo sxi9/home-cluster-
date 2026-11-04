@@ -39,10 +39,25 @@ Owner: sxi9. Design history: docs/SESSION-LOG.md.
 - Keep shellcheck clean (`shellcheck -S style`), `python3 -m py_compile`, and
   `bash tests/smoke.sh` green before pushing. CI runs the same.
 
+## Learned from the real llama.cpp build (2026-11, tag b12098)
+- The rpc binary is `ggml-rpc-server` (older tags: `rpc-server`); scripts detect
+  via `cmake --build build --target help` and install it as `rpc-server`.
+- `rpc-server` has no `--mem` any more; RPC_MEM_MB is a planner-side cap only.
+- RPC devices are named `RPC0, RPC1…` in `--rpc` order (older: `RPC[host:port]`);
+  `cluster run` resolves names with `llama-server --rpc ... --list-devices`.
+- Speculative flags: `--spec-draft-n-max/min` (older `--draft-max/min`);
+  mmap/mlock: `--load-mode` (older `--mlock/--no-mmap`). `server_has()` detects.
+- Default build is shared libs: always `-DBUILD_SHARED_LIBS=OFF`.
+- llama-server no longer logs per-device buffer sizes at default verbosity;
+  `cluster run` estimates them (`buffer_estimated`).
+- rpc-server serves one client at a time: never probe it with a TCP connect
+  mid-run; the agent reads /proc/net/tcp instead.
+
 ## Testing reality
-Nothing has run on real hardware yet. Dry runs use a fake `ip` shim; the smoke
-test uses fake heartbeats and a fake llama-server. worker.ps1 has not been
-syntax-checked (no PowerShell here). First real test: the two laptops.
+The model path was verified for real in the cloud container (real rpc-servers,
+real llama-server, real model). The install scripts (systemd, k3s, NFS,
+Tailscale, Termux) have only been dry-run; worker.ps1 is unchecked (no
+PowerShell here). First real hardware test: the two laptops.
 
 ## Layout
 join.sh, head.sh, worker.sh, android.sh, worker.ps1 · bin/cluster ·

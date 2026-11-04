@@ -209,14 +209,17 @@ build_rpc_server() {
     log "already built"; return
   fi
   local -a flags=(-DGGML_RPC=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-                  -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON)
+                  -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=OFF -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
+                  -DBUILD_SHARED_LIBS=OFF)
   # Adreno: llama.cpp's OpenCL backend, with the Adreno-tuned kernels.
   [[ $GPU == opencl ]] && flags+=(-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DGGML_OPENCL_EMBED_KERNELS=ON)
   run rm -rf "$SRC_DIR/build"
   run cmake -S "$SRC_DIR" -B "$SRC_DIR/build" -G Ninja "${flags[@]}"
-  run cmake --build "$SRC_DIR/build" --target rpc-server
+  local target=rpc-server   # ggml-rpc-server on current llama.cpp
+  cmake --build "$SRC_DIR/build" --target help 2>/dev/null | grep -q 'ggml-rpc-server' && target=ggml-rpc-server
+  run cmake --build "$SRC_DIR/build" --target "$target"
   run mkdir -p "$INSTALL_DIR/bin"
-  run cp -f "$SRC_DIR/build/bin/rpc-server" "$INSTALL_DIR/bin/rpc-server"
+  run cp -f "$SRC_DIR/build/bin/$target" "$INSTALL_DIR/bin/rpc-server"
   printf '%s:%s\n' "$built" "$GPU" | write_file "$INSTALL_DIR/BUILT_REF"
 }
 
@@ -261,7 +264,7 @@ install_services() {
 . $ENV_FILE
 ip=\$(ip -o -4 addr show dev "\$LAN_IFACE" 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 [ -n "\$ip" ] || ip=0.0.0.0
-exec $INSTALL_DIR/bin/rpc-server --host "\$ip" --port "\$RPC_PORT" --mem "\$RPC_MEM_MB" --threads "\$RPC_THREADS" 2>&1
+exec $INSTALL_DIR/bin/rpc-server --host "\$ip" --port "\$RPC_PORT" --threads "\$RPC_THREADS" 2>&1
 RUN
   write_file "$SV_DIR/rpc-server/log/run" 0755 <<RUN
 #!/data/data/com.termux/files/usr/bin/sh

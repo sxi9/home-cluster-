@@ -476,12 +476,15 @@ build_rpc_server() {
   # Only the rpc-server target: no curl, native CPU flags, chosen GPU backend.
   run rm -rf "$SRC_DIR/build"
   run cmake -S "$SRC_DIR" -B "$SRC_DIR/build" \
-      -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON \
+      -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=OFF "${gpu_flags[@]}"
-  run cmake --build "$SRC_DIR/build" --config Release -j "$(nproc)" --target rpc-server
+  # the binary is ggml-rpc-server on current llama.cpp, rpc-server on older tags
+  local target=rpc-server
+  cmake --build "$SRC_DIR/build" --target help 2>/dev/null | grep -q 'ggml-rpc-server' && target=ggml-rpc-server
+  run cmake --build "$SRC_DIR/build" --config Release -j "$(nproc)" --target "$target"
   run install -d -m 0755 "$INSTALL_DIR/bin"
-  run install -m 0755 "$SRC_DIR/build/bin/rpc-server" "$INSTALL_DIR/bin/rpc-server"
+  run install -m 0755 "$SRC_DIR/build/bin/$target" "$INSTALL_DIR/bin/rpc-server"
   printf '%s:%s\n' "$built_ref" "$GPU" | write_file "$INSTALL_DIR/BUILT_REF"
 }
 
@@ -506,7 +509,6 @@ RPC_MEM_MB=$RPC_MEM_MB
 RPC_THREADS=$RPC_THREADS
 RPC_CACHE=$RPC_CACHE
 RPC_EXTRA_ARGS=$( (( RPC_CACHE )) && echo "-c" )
-RPC_MEM_ARGS=$( [[ $GPU == cpu ]] && echo "--mem $RPC_MEM_MB" )
 GPU=$GPU
 GPU_NAME=$GPU_NAME
 AGENT_PORT=$AGENT_PORT
@@ -541,7 +543,8 @@ Group=$SERVICE_USER
 EnvironmentFile=$ENV_FILE
 Environment=HOME=$SERVICE_HOME
 # rpc-server has no authentication: bind to the wired LAN address only.
-ExecStart=$INSTALL_DIR/bin/rpc-server --host \${LAN_IP} --port \${RPC_PORT} --threads \${RPC_THREADS} \$RPC_MEM_ARGS \$RPC_EXTRA_ARGS
+# RPC_MEM_MB is a planner-side cap (rpc-server no longer takes --mem); the agent reports it.
+ExecStart=$INSTALL_DIR/bin/rpc-server --host \${LAN_IP} --port \${RPC_PORT} --threads \${RPC_THREADS} \$RPC_EXTRA_ARGS
 Restart=always
 RestartSec=3
 # Lose the model, not the box: the kernel kills this first under pressure.

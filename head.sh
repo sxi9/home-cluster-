@@ -269,12 +269,15 @@ build_llama() {
             gpu_flags=(-DGGML_HIP=ON ${gfx:+-DAMDGPU_TARGETS=$gfx} -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++) ;;
   esac
   run rm -rf "$SRC_DIR/build"
-  run cmake -S "$SRC_DIR" -B "$SRC_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON \
+  run cmake -S "$SRC_DIR" -B "$SRC_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON \
       -DLLAMA_BUILD_SERVER=ON "${gpu_flags[@]}"
-  run cmake --build "$SRC_DIR/build" --config Release -j "$(nproc)" --target llama-server llama-cli llama-bench rpc-server
+  local rpc=rpc-server   # ggml-rpc-server on current llama.cpp, rpc-server on older tags
+  cmake --build "$SRC_DIR/build" --target help 2>/dev/null | grep -q 'ggml-rpc-server' && rpc=ggml-rpc-server
+  run cmake --build "$SRC_DIR/build" --config Release -j "$(nproc)" --target llama-server llama-cli llama-bench "$rpc"
   run install -d -m 0755 "$INSTALL_DIR/bin"
-  local b; for b in llama-server llama-cli llama-bench rpc-server; do run install -m 0755 "$SRC_DIR/build/bin/$b" "$INSTALL_DIR/bin/$b"; done
+  local b; for b in llama-server llama-cli llama-bench; do run install -m 0755 "$SRC_DIR/build/bin/$b" "$INSTALL_DIR/bin/$b"; done
+  run install -m 0755 "$SRC_DIR/build/bin/$rpc" "$INSTALL_DIR/bin/rpc-server"
   # shared libs, when llama.cpp was built shared
   if compgen -G "$SRC_DIR/build/bin/*.so*" >/dev/null; then run cp -a "$SRC_DIR"/build/bin/*.so* "$INSTALL_DIR/bin/"; fi
   printf '%s:%s\n' "$LLAMA_REF" "$GPU" | write_file "$INSTALL_DIR/BUILT_REF"
