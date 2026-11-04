@@ -33,22 +33,59 @@ language model can run across all of them, with k3s for grouped services.
 | `join.sh`     | planned | `./join.sh head | worker | android`                       |
 | dashboard     | planned | nodes, free RAM, layers held, tokens/sec                  |
 
+## Quick start (one command per device)
+
+On the head, run `head.sh` once. It prints a join command and serves a small
+join directory on the LAN. On every other device, paste that command:
+
+```bash
+curl -fsSL http://HEAD-IP:8787/worker.sh | sudo bash
+```
+
+That is the whole setup for an Ubuntu worker. With no flags, `worker.sh`:
+
+1. finds the head (the `--join` URL, `cluster-head.local`, or the Tailscale
+   name `head`),
+2. takes the head address, version pins and k3s token from the join service,
+3. names generic hosts `worker-<mac-suffix>`,
+4. picks the wired interface, or Wi-Fi if that is all there is,
+5. installs and starts everything, and saves its settings for flagless re-runs.
+
+Phones get the same experience through `android.sh` (coming next), which
+prepares the Termux chroot and then runs `worker.sh` inside it.
+
 ### worker.sh
 
 ```bash
-sudo ./worker.sh --dry-run --head 192.168.1.10          # preview, changes nothing
-sudo ./worker.sh --head 192.168.1.10 --name laptop2     # first join (token: flag, env, ssh, or prompt)
-sudo ./worker.sh                                        # re-run after reboot/wipe, settings are saved
-sudo ./worker.sh --leave                                # undo
+sudo ./worker.sh --dry-run                               # preview, changes nothing
+sudo ./worker.sh --head 192.168.1.10 --token TOKEN       # fully manual join
+sudo ./worker.sh --name laptop2 --rpc-reserve-mb 4096    # override anything
+sudo ./worker.sh                                         # re-run after reboot/wipe
+sudo ./worker.sh --leave                                 # undo
 ```
+
+Precedence: flags > values the head publishes > saved `worker.env` > defaults.
 
 Files it leaves on the worker: `/etc/home-cluster/worker.env`,
 `/etc/home-cluster/token`, `/etc/systemd/system/rpc-server.service`,
 `/opt/llama.cpp/`, an fstab line for `/mnt/cluster`, and the k3s agent.
 
-If the head publishes `/srv/cluster/cluster.env` with `LLAMA_REF=` and
-`K3S_VERSION=`, workers build against those pins. The llama.cpp RPC protocol
-must match on both ends, so head.sh will write that file.
+### Join service contract (what head.sh must serve)
+
+`head.sh` serves `/srv/cluster/join/` over plain HTTP on port 8787, bound to
+the LAN interface only. The directory holds:
+
+| file          | content                                                      |
+|---------------|--------------------------------------------------------------|
+| `worker.sh`   | a copy of this repo's worker.sh, so devices never need git   |
+| `cluster.env` | `HEAD=`, `HEAD_SSH=`, `RPC_PORT=`, `LLAMA_REF=`, `K3S_VERSION=` |
+| `token`       | the k3s node-token                                           |
+
+The llama.cpp RPC protocol must match on both ends, so workers always build
+against the `LLAMA_REF` the head publishes. The token travels over the home
+LAN unencrypted; the head should firewall the port to the LAN subnet. The
+same `cluster.env` is also mirrored on the NFS share for workers that join
+later with the service down.
 
 ## Build order
 

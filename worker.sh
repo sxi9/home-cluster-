@@ -17,7 +17,9 @@
 #   9. host tweaks firewall rules, ignore laptop lid close
 #
 # Usage:
-#   sudo ./worker.sh --head 192.168.1.10 [--token TOKEN | --token-file PATH]
+#   curl -fsSL http://HEAD:8787/worker.sh | sudo bash     # what head.sh prints
+#   sudo ./worker.sh                                      # same, from a checkout
+#   sudo ./worker.sh --head 192.168.1.10 --token TOKEN    # fully manual
 #   sudo ./worker.sh --dry-run --head 192.168.1.10      # print the plan only
 #   sudo ./worker.sh --leave                            # undo everything
 #
@@ -45,11 +47,13 @@ NFS_MOUNT=/mnt/cluster
 NFS_EXPORT=/srv/cluster
 LLAMA_REPO=https://github.com/ggml-org/llama.cpp
 K3S_PORT=6443
+JOIN_PORT=8787          # head.sh serves /srv/cluster/join here (LAN only)
 
 # ----------------------------------------------------------------------------
 # defaults (overridable by flags, env, or an existing worker.env)
 # ----------------------------------------------------------------------------
 HEAD=""                 # LAN IP or name of the head node (k3s, NFS, rpc traffic)
+JOIN_URL="${JOIN_URL:-}" # http://head:8787 — found automatically when empty
 HEAD_SSH=""             # name to ssh to the head (Tailscale); defaults to HEAD
 NODE_NAME=""            # hostname to use; defaults to current hostname
 LAN_IFACE=""            # wired interface; auto-detected if empty
@@ -102,11 +106,18 @@ write_file() {
 }
 
 usage() {
-  sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+  if [[ -r $0 ]] && grep -q 'worker.sh — join' "$0"; then
+    sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+  fi
   cat <<USAGE
+Easiest: on the head, run head.sh, then on each device paste the command it
+prints. It looks like:   curl -fsSL http://HEAD:$JOIN_PORT/worker.sh | sudo bash
+With no flags the worker finds the head on the LAN, fetches the token and the
+version pins from it, and names itself.
 
 Options:
-  --head HOST            LAN IP/name of the head node (required on first run)
+  --join URL             head's join service (default: auto, http://HEAD:$JOIN_PORT)
+  --head HOST            LAN IP/name of the head node (default: from --join)
   --head-ssh HOST        name used to ssh to the head (default: --head)
   --name NAME            set this machine's hostname / k3s node name
   --lan-iface IFACE      interface for model + k3s traffic (auto: wired, else Wi-Fi)
@@ -126,9 +137,18 @@ Options:
 USAGE
 }
 
+declare -A FLAG_SET=()
 parse_args() {
   while (( $# )); do
     case $1 in
+      --head)      FLAG_SET[HEAD]=1 ;;
+      --head-ssh)  FLAG_SET[HEAD_SSH]=1 ;;
+      --rpc-port)  FLAG_SET[RPC_PORT]=1 ;;
+      --llama-ref) FLAG_SET[LLAMA_REF]=1 ;;
+      --k3s-version) FLAG_SET[K3S_VERSION]=1 ;;
+    esac
+    case $1 in
+      --join)            JOIN_URL=$2; shift 2 ;;
       --head)            HEAD=$2; shift 2 ;;
       --head-ssh)        HEAD_SSH=$2; shift 2 ;;
       --name)            NODE_NAME=$2; shift 2 ;;
@@ -163,6 +183,7 @@ preflight() {
   [[ $EUID -eq 0 ]] || die "run as root (sudo ./worker.sh ...)"
   [[ -r /etc/os-release ]] || die "cannot read /etc/os-release"
   command -v ip >/dev/null || die "iproute2 is missing (apt-get install iproute2)"
+  command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates; }
   # shellcheck disable=SC1091
   . /etc/os-release
   case ${ID:-}:${ID_LIKE:-} in
@@ -180,17 +201,19 @@ preflight() {
   [[ -d /run/systemd/system ]] && HAS_SYSTEMD=1
   (( HAS_SYSTEMD )) || warn "no systemd (chroot?) — service and k3s steps will be skipped"
 
-  [[ -n $HEAD ]] || die "--head is required (LAN IP or name of the head node)"
+  detect_lan
+  discover_head
+  [[ -n $HEAD ]] || die "no head found: pass --head HOST or --join http://HOST:$JOIN_PORT"
   HEAD_SSH=${HEAD_SSH:-$HEAD}
 
   NODE_NAME=${NODE_NAME:-$(hostname -s)}
   case $NODE_NAME in
     localhost|ubuntu|debian|android|"")
-      die "hostname '$NODE_NAME' is not unique enough for a cluster; pass --name" ;;
+      # generic hostname (fresh install, phone chroot): derive a stable one
+      NODE_NAME="worker-$(tr -d : < "/sys/class/net/$LAN_IFACE/address" | tail -c 7)"
+      log "hostname was generic, using $NODE_NAME (override with --name)" ;;
   esac
   set_hostname
-
-  detect_lan
   MEM_TOTAL_MB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 ))
   RPC_MEM_MB=$(( MEM_TOTAL_MB - RPC_RESERVE_MB ))
   (( RPC_MEM_MB > 512 )) || die "only ${MEM_TOTAL_MB} MB RAM; lower --rpc-reserve-mb"
@@ -204,6 +227,38 @@ preflight() {
     llama.cpp   : $LLAMA_REF
     k3s         : ${K3S_VERSION:-installer default}
 INFO
+}
+
+# discover_head: find the head's join service and take settings from it.
+# head.sh serves /srv/cluster/join on JOIN_PORT, LAN only. It holds:
+#   cluster.env   HEAD, HEAD_SSH, RPC_PORT, LLAMA_REF, K3S_VERSION (pins)
+#   token         the k3s node-token
+#   worker.sh     this script, so devices never need git
+# Flags still win over anything fetched here.
+discover_head() {
+  local -a cands=()
+  [[ -n $JOIN_URL ]] && cands+=("$JOIN_URL")
+  [[ -n $HEAD ]] && cands+=("http://$HEAD:$JOIN_PORT")
+  cands+=("http://cluster-head.local:$JOIN_PORT" "http://head:$JOIN_PORT")
+  local u tmp; tmp=$(mktemp)
+  for u in "${cands[@]}"; do
+    if curl -fsS --max-time 5 "$u/cluster.env" -o "$tmp" 2>/dev/null; then
+      JOIN_URL=$u
+      log "found head's join service at $u"
+      # only take keys we know, and only where no flag was given
+      local k v
+      while IFS='=' read -r k v; do
+        case $k in
+          HEAD|HEAD_SSH|RPC_PORT|LLAMA_REF|K3S_VERSION)
+            [[ -n ${FLAG_SET[$k]:-} ]] || printf -v "$k" '%s' "$v" ;;
+        esac
+      done < <(grep -E '^[A-Z0-9_]+=' "$tmp")
+      [[ -n $HEAD ]] || HEAD=$(sed -E 's|^https?://([^:/]+).*|\1|' <<<"$u")
+      break
+    fi
+  done
+  rm -f "$tmp"
+  [[ -n $JOIN_URL ]] || warn "no join service reachable; using flags/saved settings only"
 }
 
 # set_hostname: make the box answer to NODE_NAME (k3s and Tailscale use it).
@@ -377,6 +432,7 @@ write_env() {
 # and by the cluster tooling. Re-run worker.sh after editing.
 HEAD=$HEAD
 HEAD_SSH=$HEAD_SSH
+JOIN_URL=$JOIN_URL
 NODE_NAME=$NODE_NAME
 LAN_IFACE=$LAN_IFACE
 LAN_IP=$LAN_IP
@@ -445,6 +501,10 @@ resolve_token() {
     TOKEN=$(<"$TOKEN_PATH")
   elif [[ -z $TOKEN && -r $TOKEN_FILE ]]; then
     TOKEN=$(<"$TOKEN_FILE")
+  fi
+  if [[ -z $TOKEN && -n $JOIN_URL ]]; then
+    TOKEN=$(curl -fsS --max-time 5 "$JOIN_URL/token" 2>/dev/null || true)
+    [[ -n $TOKEN ]] && log "token fetched from $JOIN_URL"
   fi
   if [[ -z $TOKEN ]]; then
     # Tailscale SSH makes this work with no keys: the head's node-token is the
@@ -564,7 +624,7 @@ load_saved() {
   [[ -r $ENV_FILE ]] || return 0
   log "loading saved settings from $ENV_FILE (flags override)"
   # shellcheck disable=SC1090
-  . <(grep -E '^[A-Z_]+=' "$ENV_FILE")
+  . <(grep -E '^[A-Z0-9_]+=' "$ENV_FILE")
   LAN_IP="" LINK_TYPE="" RPC_MEM_MB=""   # always recomputed
 }
 
