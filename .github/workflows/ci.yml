@@ -1,0 +1,21 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck + bash -n
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          bash -n worker.sh head.sh android.sh join.sh tests/smoke.sh
+          shellcheck -S style worker.sh head.sh android.sh join.sh tests/smoke.sh
+      - name: python compile
+        run: python3 -m py_compile bin/cluster head/clusterd.py agent/cluster-agent.py
+      - name: smoke test (clusterd, agent, planner, fake llama-server)
+        run: bash tests/smoke.sh
+      - name: dry runs
+        run: |
+          sudo ./worker.sh --dry-run --head 192.0.2.1 --token x --no-nfs >/dev/null
+          sudo ./head.sh --dry-run >/dev/null
+          PREFIX=/tmp/fake-termux HOME=/tmp/fake-home bash android.sh --dry-run --head 192.0.2.1 --gpu cpu >/dev/null

@@ -161,9 +161,15 @@ class Handler(BaseHTTPRequestHandler):
         if name in JOIN_FILES:
             try:
                 with open(os.path.join(JOIN_DIR, name), "rb") as f:
-                    return self._send(200, f.read(), "text/plain; charset=utf-8")
+                    body = f.read()
             except OSError:
                 return self._send(404, {"error": "%s not published yet" % name})
+            if name.endswith(".sh"):
+                # bake this head's address into the script, so `curl | bash` needs no flags
+                # even on phones, which cannot resolve .local names
+                me = cfg("JOIN_URL") or "http://%s:%s" % (cfg("HEAD", self.server.server_address[0]), cfg("CLUSTERD_PORT", "8787"))
+                body = body.replace(b'JOIN_URL_DEFAULT=""', ('JOIN_URL_DEFAULT="%s"' % me).encode(), 1)
+            return self._send(200, body, "text/plain; charset=utf-8")
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):

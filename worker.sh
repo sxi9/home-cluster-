@@ -57,7 +57,8 @@ JOIN_PORT=8787          # head.sh serves /srv/cluster/join here (LAN only)
 # defaults (overridable by flags, env, or an existing worker.env)
 # ----------------------------------------------------------------------------
 HEAD=""                 # LAN IP or name of the head node (k3s, NFS, rpc traffic)
-JOIN_URL="${JOIN_URL:-}" # http://head:8787 — found automatically when empty
+JOIN_URL_DEFAULT=""     # filled in by the head when it serves this file
+JOIN_URL="${JOIN_URL:-$JOIN_URL_DEFAULT}" # http://head:8787 — found automatically when empty
 HEAD_SSH=""             # name to ssh to the head (Tailscale); defaults to HEAD
 NODE_NAME=""            # hostname to use; defaults to current hostname
 LAN_IFACE=""            # wired interface; auto-detected if empty
@@ -220,7 +221,7 @@ preflight() {
   case $NODE_NAME in
     localhost|ubuntu|debian|android|"")
       # generic hostname (fresh install, phone chroot): derive a stable one
-      NODE_NAME="worker-$(tr -d : < "/sys/class/net/$LAN_IFACE/address" | tail -c 7)"
+      NODE_NAME="worker-$( (cat "/sys/class/net/$LAN_IFACE/address" 2>/dev/null || echo "$LAN_IP") | tr -d :. | tail -c 7)"
       log "hostname was generic, using $NODE_NAME (override with --name)" ;;
   esac
   set_hostname
@@ -269,7 +270,10 @@ discover_head() {
     fi
   done
   rm -f "$tmp"
+  # an explicit/baked URL names the head even when cluster.env is not published yet
+  [[ -z $HEAD && -n $JOIN_URL ]] && HEAD=$(sed -E 's|^https?://([^:/]+).*|\1|' <<<"$JOIN_URL")
   [[ -n $JOIN_URL ]] || warn "no join service reachable; using flags/saved settings only"
+  return 0
 }
 
 # detect_gpu: resolve --gpu auto from the PCI vendor ids in /sys/class/drm.
@@ -520,7 +524,9 @@ install_rpc_service() {
         --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
   # GPU device nodes are owned by these groups on Ubuntu.
-  local g; for g in video render; do getent group "$g" >/dev/null && run usermod -aG "$g" "$SERVICE_USER"; done
+  local g; for g in video render; do
+    if getent group "$g" >/dev/null; then run usermod -aG "$g" "$SERVICE_USER"; fi
+  done
   write_file "$UNIT_FILE" 0644 <<UNIT
 [Unit]
 Description=llama.cpp RPC worker (home-cluster)
