@@ -77,7 +77,7 @@ curl -fsS "http://127.0.0.1:$PORT_D/worker.sh" | grep -q "^JOIN_URL_DEFAULT=\"ht
 # 1b. login
 [[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_D/") == 302 ]] && ok "dashboard redirects to /login without a session" || fail "login redirect"
 [[ $(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 1.2.3.4' "http://127.0.0.1:$PORT_D/api/nodes") == 200 ]] && ok "localhost CLI bypass for /api" || fail "api bypass"
-curl -fsS "http://127.0.0.1:$PORT_D/login" | grep -q 'name="pass"' && ok "login page renders" || fail "login page"
+curl -fsS "http://127.0.0.1:$PORT_D/login" | grep 'name="pass"' >/dev/null && ok "login page renders" || fail "login page"
 [[ $(curl -s -o /dev/null -w '%{http_code}' --data 'user=admin&pass=wrong' "http://127.0.0.1:$PORT_D/login") == 302 ]] && ok "wrong password bounces" || fail "wrong pw"
 curl -s -c "$T/cj" -o /dev/null --data 'user=admin&pass=testpass' "http://127.0.0.1:$PORT_D/login"
 grep -q hc_session "$T/cj" && ok "right password sets a session cookie" || fail "login cookie"
@@ -105,7 +105,7 @@ grep -q "phone-a" "$T/plan.txt" && ok "wifi phone pulled in because the model ne
 "$REPO/bin/cluster" plan test-24b-q4.gguf --ctx 4096 --draft test-24b-q4.gguf | grep -- "-md .*--device-draft Vulkan0" >/dev/null && ok "speculative decoding wired to the head GPU" || fail "draft"
 "$REPO/bin/cluster" models | grep "test-24b-q4.gguf.*48" >/dev/null && ok "cluster models lists the share" || fail "models"
 "$REPO/bin/cluster" tune KV_CACHE_TYPE=q8_0 FLASH_ATTN=on >/dev/null && "$REPO/bin/cluster" plan test-24b-q4.gguf | grep -- "-ctk q8_0 -ctv q8_0" >/dev/null && ok "cluster tune settings reach the llama-server command" || fail "tune"
-"$REPO/bin/cluster" tune --auto | grep -q "KV_CACHE_TYPE=q8_0" && ok "cluster tune --auto explains its choices" || fail "auto tune"
+"$REPO/bin/cluster" tune --auto | grep "KV_CACHE_TYPE=q8_0" >/dev/null && ok "cluster tune --auto explains its choices" || fail "auto tune"
 "$REPO/bin/cluster" tune KV_CACHE_TYPE=f16 FLASH_ATTN=auto THREADS=auto MLOCK=off UBATCH=512 MARGIN_PCT=12 WIFI_MAX_PCT=30 ORDER=bench >/dev/null
 "$REPO/bin/cluster" top | grep -E "^head|cluster-agent|python" >/dev/null && ok "cluster top lists processes" || fail "top"
 
