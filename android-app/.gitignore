@@ -5,3 +5,5 @@ local.properties
 *.iml
 .idea/
 app/src/main/jniLibs/arm64-v8a/librpc-server.so
+app/src/main/jniLibs/arm64-v8a/librpc-server-cl.so
+.opencl/

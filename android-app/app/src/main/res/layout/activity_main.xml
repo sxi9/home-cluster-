@@ -25,6 +25,8 @@
         <EditText android:id="@+id/reserveMb" android:inputType="number" android:text="2048"
             android:layout_width="match_parent" android:layout_height="wrap_content" />
 
+        <Switch android:id="@+id/useGpu" android:text="Use Adreno GPU (OpenCL)" android:checked="true"
+            android:layout_marginTop="8dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
         <Switch android:id="@+id/autostart" android:text="Start at boot" android:checked="true"
             android:layout_marginTop="8dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
 

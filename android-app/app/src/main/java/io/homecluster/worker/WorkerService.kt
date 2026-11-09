@@ -56,33 +56,63 @@ class WorkerService : Service() {
         return START_STICKY
     }
 
+    /** Snapdragon phones ship the real OpenCL driver as /vendor/lib64/libOpenCL.so. */
+    private fun vendorOpenCL(): Boolean = listOf("/vendor/lib64/libOpenCL.so", "/system/vendor/lib64/libOpenCL.so").any { File(it).exists() }
+
+    private fun socName(): String {
+        val soc = if (Build.VERSION.SDK_INT >= 31) listOf(Build.SOC_MANUFACTURER, Build.SOC_MODEL).filter { it.isNotBlank() && it != Build.UNKNOWN }.joinToString(" ") else ""
+        return if (soc.isNotBlank()) "Adreno ($soc)" else "Adreno (${Build.HARDWARE})"
+    }
+
     private fun supervise(prefs: Prefs) {
-        val exe = File(applicationInfo.nativeLibraryDir, "librpc-server.so")
-        if (!exe.exists()) { WorkerState.log("rpc-server binary missing from the APK (${exe.path})"); return }
-        exe.setExecutable(true)
+        val cpuExe = File(applicationInfo.nativeLibraryDir, "librpc-server.so")
+        val clExe = File(applicationInfo.nativeLibraryDir, "librpc-server-cl.so")
+        if (!cpuExe.exists()) { WorkerState.log("rpc-server binary missing from the APK (${cpuExe.path})"); return }
+        cpuExe.setExecutable(true); clExe.setExecutable(true)
         Root.check()
+        var useGpu = prefs.useGpu && clExe.exists() && vendorOpenCL()
+        if (prefs.useGpu && !clExe.exists()) WorkerState.log("this APK has no OpenCL build; CPU only")
+        else if (prefs.useGpu && !vendorOpenCL()) WorkerState.log("no /vendor/lib64/libOpenCL.so on this phone; CPU only")
+        var gpuFailures = 0
         while (!stopRequested) {
+            val exe = if (useGpu) clExe else cpuExe
+            WorkerState.gpuKind = if (useGpu) "opencl" else "cpu"
+            WorkerState.gpuName = if (useGpu) socName() else null
             val lan = Net.lan()
             val ip = lan?.second ?: "0.0.0.0"
             WorkerState.lanIp = ip
             val threads = Runtime.getRuntime().availableProcessors().toString()
             try {
                 // RPC_MEM_MB is a planner-side cap reported by the agent; rpc-server takes no --mem
-                val p = ProcessBuilder(exe.path, "--host", ip, "--port", prefs.rpcPort.toString(), "--threads", threads)
-                    .redirectErrorStream(true).start()
+                val pb = ProcessBuilder(exe.path, "--host", ip, "--port", prefs.rpcPort.toString(), "--threads", threads)
+                    .redirectErrorStream(true)
+                if (useGpu) {
+                    // the vendor driver lives outside the app's linker namespace: point the loader at it,
+                    // and keep compiled kernels in the app cache so the GPU is ready in seconds next time
+                    pb.environment()["LD_LIBRARY_PATH"] = "/vendor/lib64:/system/vendor/lib64:/system/lib64"
+                    pb.environment()["GGML_OPENCL_KERNEL_CACHE_DIR"] = File(cacheDir, "opencl").apply { mkdirs() }.path
+                }
+                val started = System.currentTimeMillis()
+                val p = pb.start()
                 proc = p
                 WorkerState.rpcPid = pidOf(p)
                 WorkerState.rpcAlive = true
-                WorkerState.log("rpc-server started on $ip:${prefs.rpcPort} (${if (Root.available == true) "root" else "no root"})")
+                WorkerState.log("rpc-server (${if (useGpu) "Adreno OpenCL" else "CPU"}) started on $ip:${prefs.rpcPort} (${if (Root.available == true) "root" else "no root"})")
                 updateNotification("serving $ip:${prefs.rpcPort}")
                 Root.tweaks(packageName, WorkerState.rpcPid)
                 p.inputStream.bufferedReader().forEachLine { WorkerState.log(it) }
                 p.waitFor()
                 WorkerState.rpcAlive = false
                 WorkerState.log("rpc-server exited with ${p.exitValue()}")
+                if (useGpu && System.currentTimeMillis() - started < 15_000 && ++gpuFailures >= 2) {
+                    useGpu = false
+                    WorkerState.gpuFallback = "OpenCL binary kept dying at start; using the CPU binary"
+                    WorkerState.log(WorkerState.gpuFallback!!)
+                }
             } catch (e: Exception) {
                 WorkerState.rpcAlive = false
                 WorkerState.log("rpc-server failed: $e")
+                if (useGpu && ++gpuFailures >= 2) { useGpu = false; WorkerState.gpuFallback = "OpenCL binary would not start; using the CPU binary" }
             }
             if (stopRequested) break
             updateNotification("rpc-server restarting")

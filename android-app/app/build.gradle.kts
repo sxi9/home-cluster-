@@ -11,8 +11,8 @@ android {
         applicationId = "io.homecluster.worker"
         minSdk = 26           // Android 8.0+
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
         ndk { abiFilters += "arm64-v8a" }
     }
     // rpc-server ships as "librpc-server.so" and is executed from the app's native

@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - name: build rpc-server for arm64 with the NDK
-        run: ANDROID_NDK="$ANDROID_NDK_LATEST_HOME" android-app/build-rpc-server.sh "${{ github.event.inputs.llama_ref || 'master' }}"
+        run: ANDROID_NDK="$ANDROID_NDK_LATEST_HOME" android-app/build-rpc-server.sh "${{ github.event.inputs.llama_ref || 'master' }}" all
       - name: build the APK
         run: cd android-app && gradle --no-daemon assembleDebug
       - name: rename

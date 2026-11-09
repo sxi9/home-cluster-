@@ -10,6 +10,9 @@ object WorkerState {
     @Volatile var lastHeartbeat = 0L
     @Volatile var llamaRef: String = "unknown"
     @Volatile var lanIp: String = "?"
+    @Volatile var gpuKind: String = "cpu"        // "opencl" while the Adreno binary serves
+    @Volatile var gpuName: String? = null
+    @Volatile var gpuFallback: String? = null    // why the GPU binary was abandoned, if it was
     private val lines = ArrayDeque<String>()
 
     @Synchronized fun log(s: String) { lines.addLast(s.take(200)); while (lines.size > 40) lines.removeFirst() }

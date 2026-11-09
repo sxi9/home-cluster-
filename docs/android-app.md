@@ -12,7 +12,7 @@ runs it as a foreground service, with the same agent the other devices run.
 | survives memory pressure | mostly: ask for the battery exemption in the app | yes: `oom_score_adj -1000` on rpc-server |
 | starts at boot | yes (switch in the app) | yes |
 | Wi‑Fi stays on in sleep | depends on the phone's settings | forced on |
-| GPU (Adreno OpenCL) | no, CPU only in this build | no, use `android.sh` (Termux) for the GPU path |
+| GPU (Adreno OpenCL) | yes, when the phone has `/vendor/lib64/libOpenCL.so` (Snapdragon) | yes |
 | k3s | no | no |
 
 ## Install
@@ -28,6 +28,28 @@ runs it as a foreground service, with the same agent the other devices run.
    killers (see docs/troubleshooting.md).
 4. On the head: `cluster nodes` lists the phone; the dashboard card shows
    `app: android-apk`.
+
+## Adreno GPU
+
+The APK carries two `rpc-server` binaries: a CPU one and one built with
+llama.cpp's OpenCL backend and the Adreno-tuned kernels embedded. On start the
+app picks the OpenCL binary when the "Use Adreno GPU" switch is on and the
+phone has a vendor OpenCL driver (`/vendor/lib64/libOpenCL.so`, present on
+Snapdragon phones). The driver sits outside the app's linker namespace, so
+the binary is launched with `LD_LIBRARY_PATH` pointing at the vendor
+libraries, and compiled kernels are cached in the app's cache directory so
+later starts are fast. If the OpenCL binary dies twice within its first 15
+seconds (unsupported GPU, odd driver), the app falls back to the CPU binary
+for that session and says so on its status screen and in the log.
+
+`rpc-server` picks the first non-CPU device by default, so with the OpenCL
+build the Adreno GPU is what serves. The dashboard shows `opencl · Adreno
+(...)` on the phone's card. Memory is unified on phones: the GPU adds compute,
+not capacity, and whether it beats the CPU for generation varies by chipset;
+`cluster bench` measures it over RPC, then switch the toggle and bench again.
+
+Supported per llama.cpp's docs: Adreno 750 (8 Gen 3), 810 (7s Gen 3), 830 (8
+Elite), 840. Older Adreno 6xx/7xx usually run but gain little.
 
 ## Build
 
@@ -64,9 +86,8 @@ protocol may not match.
 
 ## Limits
 
-- CPU only. The Adreno OpenCL build needs the OpenCL headers and ICD loader
-  compiled for Android inside the NDK build; that is the next step for this
-  app. Phone GPUs add compute, not memory, so the pool size is the same.
+- Only Qualcomm's OpenCL driver is targeted. Mali (Samsung Exynos, Google
+  Tensor) and other GPUs fall back to CPU.
 - No process list for other apps (Android 8+ hides it); the dashboard shows
   memory, CPU, temperature, battery and storage instead.
 - Phones cannot resolve `cluster-head.local`; always use the head's IP.

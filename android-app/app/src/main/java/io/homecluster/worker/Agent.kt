@@ -114,7 +114,7 @@ class Agent(private val ctx: Context, private val prefs: Prefs, private val stat
             .put("cpus", Runtime.getRuntime().availableProcessors()).put("cpu", cpuInfo()).put("storage", storage())
             .put("processes", JSONArray()).put("alerts", alerts).put("ssh", JSONObject.NULL).put("load1", JSONObject.NULL)
             .put("mem", m)
-            .put("gpu", JSONObject().put("kind", "cpu").put("name", JSONObject.NULL).put("unified", true))
+            .put("gpu", JSONObject().put("kind", state.gpuKind).put("name", state.gpuName ?: JSONObject.NULL).put("unified", true))
             .put("temp_c", temperature()).put("battery", battery())
             .put("rpc", JSONObject().put("port", prefs.rpcPort).put("listening", state.rpcAlive).put("mem_mb", state.offeredMb))
             .put("llama_ref", state.llamaRef).put("standby", false).put("root", Root.available ?: false)
