@@ -67,6 +67,14 @@ real llama-server, real model). The install scripts (systemd, k3s, NFS,
 Tailscale, Termux) have only been dry-run; worker.ps1 is unchecked (no
 PowerShell here). First real hardware test: the two laptops.
 
+## Android app
+android-app/ (Kotlin, minSdk 26, arm64 only). rpc-server is packaged as
+lib/arm64-v8a/librpc-server.so and executed from nativeLibraryDir
+(useLegacyPackaging=true, extractNativeLibs=true). Build the binary with
+android-app/build-rpc-server.sh (NDK, static, GGML_OPENMP=OFF), then gradle.
+CI: .github/workflows/android.yml. The APK in releases/ is served by the head
+as /home-cluster-worker.apk. Keep the llama.cpp ref equal to the head's pin.
+
 ## Layout
 join.sh, head.sh, worker.sh, android.sh, worker.ps1 · bin/cluster ·
 head/clusterd.py · dashboard/index.html · agent/cluster-agent.py ·

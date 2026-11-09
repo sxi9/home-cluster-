@@ -1,0 +1,26 @@
+name: android-apk
+on:
+  push:
+    paths: ['android-app/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: llama.cpp ref to build rpc-server from (match the head's pin)
+        default: master
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: build rpc-server for arm64 with the NDK
+        run: ANDROID_NDK="$ANDROID_NDK_LATEST_HOME" android-app/build-rpc-server.sh "${{ github.event.inputs.llama_ref || 'master' }}"
+      - name: build the APK
+        run: cd android-app && gradle --no-daemon assembleDebug
+      - name: rename
+        run: cp android-app/app/build/outputs/apk/debug/app-debug.apk home-cluster-worker.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: home-cluster-worker-apk
+          path: home-cluster-worker.apk

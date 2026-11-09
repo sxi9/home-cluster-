@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AWAKE_S = 30          # a node is "awake" if it heartbeated within this many seconds
 SESSION_S = 7 * 86400 # login lasts a week
-JOIN_FILES = {"worker.sh", "android.sh", "join.sh", "worker.ps1", "cluster-agent.py", "cluster.env", "token", "head.pub"}
+JOIN_FILES = {"worker.sh", "android.sh", "join.sh", "worker.ps1", "cluster-agent.py", "cluster.env", "token", "head.pub", "home-cluster-worker.apk"}
 
 
 def read_env(path):
@@ -301,6 +301,8 @@ class Handler(BaseHTTPRequestHandler):
                     body = f.read()
             except OSError:
                 return self._send(404, {"error": "%s not published yet" % name})
+            if name.endswith(".apk"):
+                return self._send(200, body, "application/vnd.android.package-archive")
             if name.endswith(".ps1"):
                 me = cfg("JOIN_URL") or "http://%s:%s" % (cfg("HEAD", self.server.server_address[0]), cfg("CLUSTERD_PORT", "8787"))
                 body = body.replace(b'$JoinUrlDefault = ""', ('$JoinUrlDefault = "%s"' % me).encode(), 1)

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent">
+    <LinearLayout android:orientation="vertical" android:padding="20dp"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+
+        <TextView android:text="home-cluster worker" android:textSize="22sp" android:textStyle="bold"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <TextView android:id="@+id/subtitle" android:text="This phone's RAM and CPU join the cluster through llama.cpp's rpc-server."
+            android:layout_marginTop="4dp" android:layout_marginBottom="16dp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+
+        <TextView android:text="Head URL (what head.sh printed, e.g. http://192.168.1.10:8787)"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <EditText android:id="@+id/headUrl" android:inputType="textUri" android:hint="http://192.168.1.10:8787"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:text="Node name" android:layout_marginTop="8dp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <EditText android:id="@+id/nodeName" android:inputType="text" android:hint="phone-a"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:text="RAM to keep for Android (MB)" android:layout_marginTop="8dp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <EditText android:id="@+id/reserveMb" android:inputType="number" android:text="2048"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <Switch android:id="@+id/autostart" android:text="Start at boot" android:checked="true"
+            android:layout_marginTop="8dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <Button android:id="@+id/toggle" android:text="Start" android:layout_marginTop="16dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+        <Button android:id="@+id/battery" android:text="Allow running in background (battery settings)"
+            android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:id="@+id/status" android:text="stopped" android:fontFamily="monospace" android:textSize="13sp"
+            android:layout_marginTop="16dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
+    </LinearLayout>
+</ScrollView>

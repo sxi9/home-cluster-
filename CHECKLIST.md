@@ -32,6 +32,16 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Dashboard card shows GPU and VRAM if it has a GPU
 - [ ] Reboot the laptop: everything comes back without touching it
 
+## Android phone with the app (root optional)
+
+- [ ] Open `http://HEAD-IP:8787/home-cluster-worker.apk` on the phone, install
+- [ ] Enter the head URL, Start; status shows `rpc-server: up` and `head: http://...` with a recent heartbeat
+- [ ] Tap "Allow running in background", accept; on Xiaomi/Huawei/OnePlus also lock the app in recents
+- [ ] Rooted: status says `root: yes`; grant the su prompt once
+- [ ] On the head: `cluster nodes` lists the phone with rpc `up`; dashboard card shows `app: android-apk`
+- [ ] Screen off for 10 minutes: the phone stays awake on the dashboard
+- [ ] Reboot the phone: it comes back within a minute (Start at boot switch)
+
 ## Snapdragon phone (Termux)
 
 - [ ] Termux (F-Droid/GitHub build, not the old Play Store one), Termux:Boot, Tailscale installed
@@ -93,5 +103,7 @@ Tick these off in order. Each section is independent once the head is up.
 - [x] `cluster bench` / `cluster tune` / `cluster top` / `cluster kill`, hardware details, network diagram
 - [x] Real RPC split verified in the cloud with llama.cpp master (see README)
 - [x] Dashboard login, `cluster tune --auto`, standby head with automatic failover (untested on hardware)
+- [x] Android app (root and non-root) with rpc-server inside; APK built, not yet installed on a phone
+- [ ] Android app: Adreno OpenCL build
 - [ ] Tested worker.ps1 on the Windows laptop
 - [ ] iOS worker app

@@ -531,6 +531,10 @@ ENV
     [[ -r $REPO_DIR/$f ]] && run install -m 0644 -o "$SERVICE_USER" "$REPO_DIR/$f" "$JOIN_DIR/$f"
   done
   run install -m 0644 -o "$SERVICE_USER" "$REPO_DIR/agent/cluster-agent.py" "$JOIN_DIR/cluster-agent.py"
+  # the Android app, if a build was dropped into the repo (releases/) or next to the join dir
+  local apk; for apk in "$REPO_DIR/releases/home-cluster-worker.apk" "$ROOT/home-cluster-worker.apk"; do
+    [[ -s $apk ]] && { run install -m 0644 -o "$SERVICE_USER" "$apk" "$JOIN_DIR/home-cluster-worker.apk"; break; }
+  done
   [[ -s $JOIN_DIR/token ]] || warn "no k3s token published yet (k3s skipped?); workers will prompt for one"
 }
 
@@ -574,7 +578,9 @@ summary() {
   Join an Ubuntu laptop (run on that machine):
       curl -fsSL http://$LAN_IP:$CLUSTERD_PORT/worker.sh | sudo bash
 
-  Join a rooted Android phone (in Termux):
+  Join an Android phone with the app (root optional): open this on the phone, install, enter the head URL:
+      http://$LAN_IP:$CLUSTERD_PORT/home-cluster-worker.apk
+  ...or with Termux (rooted, Adreno GPU option):
       curl -fsSL http://$LAN_IP:$CLUSTERD_PORT/android.sh | bash
 
   Join a Windows PC natively (model pool only, elevated PowerShell):
