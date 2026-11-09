@@ -216,6 +216,17 @@ Bugs the real binaries caught, all fixed: the rpc-server binary was renamed to
 default build is shared libraries (the scripts now build static). See
 [docs/network.md](docs/network.md) for how the devices connect.
 
+## The Android app, running
+
+Captured in an Android emulator in this project's build container (software
+emulation, so slow): the app's `rpc-server` is up and serving, the foreground
+notification keeps it alive, and the status screen shows the llama.cpp commit
+it was built from.
+
+| ![setup](docs/screenshots/app-setup.png) | ![running](docs/screenshots/app-running.png) | ![notification](docs/screenshots/app-notification.png) |
+|---|---|---|
+| setup screen | running: rpc-server up, backend, head, root state | the persistent notification with its Stop action |
+
 ## What is in the repo
 
 | file | runs on | purpose |
