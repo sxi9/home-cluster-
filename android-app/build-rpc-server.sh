@@ -2,8 +2,9 @@
 # Build llama.cpp's rpc-server for Android arm64 with the NDK, twice:
 #   librpc-server.so     CPU backend, runs on any arm64 phone
 #   librpc-server-cl.so  OpenCL backend with the Adreno kernels, for Snapdragon phones
-# Both land in app/src/main/jniLibs/arm64-v8a (the name lets Android extract + execute them).
-#   ANDROID_NDK=/path/to/ndk ./build-rpc-server.sh [LLAMA_REF] [cpu|opencl|all]
+#   librpc-server-vk.so  Vulkan backend, for Mali (Exynos, Tensor, MediaTek) and other GPUs
+# All land in app/src/main/jniLibs/arm64-v8a (the name lets Android extract + execute them).
+#   ANDROID_NDK=/path/to/ndk ./build-rpc-server.sh [LLAMA_REF] [cpu|opencl|vulkan|all]
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REF=${1:-master}
@@ -69,5 +70,26 @@ if [[ $WHAT == opencl || $WHAT == all ]]; then
   build_one "$SRC/build-android-cl" librpc-server-cl.so \
     -DGGML_OPENCL=ON -DGGML_OPENCL_EMBED_KERNELS=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
     -DOpenCL_INCLUDE_DIR="$DEPS/OpenCL-Headers" -DOpenCL_LIBRARY="$DEPS/lib/libOpenCL.so"
+fi
+if [[ $WHAT == vulkan || $WHAT == all ]]; then
+  echo "== Vulkan backend (Mali and others)"
+  # The NDK ships the Vulkan headers, libvulkan.so and glslc; the shader generator is a host
+  # tool that ggml builds with the host compiler while cross-compiling.
+  SYSROOT=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+  GLSLC=$(find "$NDK/shader-tools" -name glslc -type f | head -n1)
+  # ggml-vulkan wants the SPIRV-Headers CMake package (header-only); install it under $DEPS
+  mkdir -p "$DEPS"
+  [[ -d $DEPS/SPIRV-Headers/.git ]] || git clone --quiet --depth 1 https://github.com/KhronosGroup/SPIRV-Headers "$DEPS/SPIRV-Headers"
+  if [[ ! -d $DEPS/spirv/share/cmake/SPIRV-Headers ]]; then
+    cmake -S "$DEPS/SPIRV-Headers" -B "$DEPS/build-spirv" -DCMAKE_INSTALL_PREFIX="$DEPS/spirv" >/dev/null
+    cmake --install "$DEPS/build-spirv" >/dev/null
+  fi
+  # ggml-vulkan is written against Vulkan-Hpp (vulkan/vulkan.hpp), which the NDK does not ship
+  [[ -d $DEPS/Vulkan-Headers/.git ]] || git clone --quiet --depth 1 https://github.com/KhronosGroup/Vulkan-Headers "$DEPS/Vulkan-Headers"
+  build_one "$SRC/build-android-vk" librpc-server-vk.so \
+    -DGGML_VULKAN=ON -DCMAKE_PREFIX_PATH="$DEPS/spirv" -DSPIRV-Headers_DIR="$DEPS/spirv/share/cmake/SPIRV-Headers" \
+    -DVulkan_INCLUDE_DIR="$DEPS/Vulkan-Headers/include" \
+    -DVulkan_LIBRARY="$SYSROOT/usr/lib/aarch64-linux-android/26/libvulkan.so" \
+    -DVulkan_GLSLC_EXECUTABLE="$GLSLC"
 fi
 echo "built from llama.cpp $(cat "$HERE/app/src/main/assets/llama_ref.txt")"

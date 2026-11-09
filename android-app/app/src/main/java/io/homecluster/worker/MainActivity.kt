@@ -12,6 +12,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
+import android.widget.RadioGroup
 import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -30,12 +31,13 @@ class MainActivity : AppCompatActivity() {
         val nodeName = findViewById<EditText>(R.id.nodeName)
         val reserve = findViewById<EditText>(R.id.reserveMb)
         val auto = findViewById<Switch>(R.id.autostart)
-        val gpu = findViewById<Switch>(R.id.useGpu)
+        val gpu = findViewById<RadioGroup>(R.id.gpuMode)
         val toggle = findViewById<Button>(R.id.toggle)
         headUrl.setText(prefs.headUrl); nodeName.setText(prefs.nodeName); reserve.setText(prefs.reserveMb.toString()); auto.isChecked = prefs.autostart
-        gpu.isChecked = prefs.useGpu
+        gpu.check(when (prefs.gpuMode) { "opencl" -> R.id.gpuOpenCL; "vulkan" -> R.id.gpuVulkan; "cpu" -> R.id.gpuCpu; else -> R.id.gpuAuto })
         val hasCl = listOf("/vendor/lib64/libOpenCL.so", "/system/vendor/lib64/libOpenCL.so").any { java.io.File(it).exists() }
-        gpu.text = if (hasCl) "Use Adreno GPU (OpenCL driver found)" else "Use Adreno GPU (no OpenCL driver on this phone)"
+        val hasVk = java.io.File("/system/lib64/libvulkan.so").exists() && packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL, 0)
+        findViewById<TextView>(R.id.gpuHint).text = "this phone: OpenCL driver ${if (hasCl) "found (Snapdragon/Adreno)" else "absent"} · Vulkan ${if (hasVk) "available" else "absent"}"
         if (nodeName.text.isBlank()) nodeName.hint = prefs.effectiveName()
 
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
@@ -46,7 +48,8 @@ class MainActivity : AppCompatActivity() {
                 prefs.enabled = false; WorkerService.stop(this)
             } else {
                 prefs.headUrl = headUrl.text.toString(); prefs.nodeName = nodeName.text.toString()
-                prefs.reserveMb = reserve.text.toString().toIntOrNull() ?: 2048; prefs.autostart = auto.isChecked; prefs.useGpu = gpu.isChecked
+                prefs.reserveMb = reserve.text.toString().toIntOrNull() ?: 2048; prefs.autostart = auto.isChecked
+                prefs.gpuMode = when (gpu.checkedRadioButtonId) { R.id.gpuOpenCL -> "opencl"; R.id.gpuVulkan -> "vulkan"; R.id.gpuCpu -> "cpu"; else -> "auto" }
                 if (prefs.headUrl.isBlank()) { headUrl.error = "needed"; return@setOnClickListener }
                 prefs.enabled = true; WorkerService.start(this)
             }
@@ -70,7 +73,7 @@ class MainActivity : AppCompatActivity() {
             appendLine(if (WorkerState.running) "RUNNING" else "stopped")
             appendLine("rpc-server : ${if (WorkerState.rpcAlive) "up on ${WorkerState.lanIp}:${prefs.rpcPort}" else "down"}")
             appendLine("offers     : ${WorkerState.offeredMb} MB RAM")
-            appendLine("backend    : ${if (WorkerState.gpuKind == "opencl") "Adreno OpenCL · " + (WorkerState.gpuName ?: "") else "CPU"}${WorkerState.gpuFallback?.let { " ($it)" } ?: ""}")
+            appendLine("backend    : ${when (WorkerState.gpuKind) { "opencl" -> "Adreno OpenCL"; "vulkan" -> "Vulkan"; else -> "CPU" }}${WorkerState.gpuName?.let { " · $it" } ?: ""}${WorkerState.gpuFallback?.let { " ($it)" } ?: ""}")
             appendLine("head       : ${WorkerState.headUrl ?: "not reachable"} (heartbeat $hb)")
             appendLine("llama.cpp  : ${WorkerState.llamaRef}")
             appendLine("root       : ${when (Root.available) { true -> "yes (memory-killer protection on)"; false -> "no (works, less resilient)"; null -> "?" }}")

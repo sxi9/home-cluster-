@@ -23,10 +23,11 @@ class Prefs(ctx: Context) {
         get() = p.getBoolean("autostart", true)
         set(v) = p.edit().putBoolean("autostart", v).apply()
 
-    /** Use the OpenCL (Adreno) rpc-server when the phone has a vendor OpenCL driver. */
-    var useGpu: Boolean
-        get() = p.getBoolean("useGpu", true)
-        set(v) = p.edit().putBoolean("useGpu", v).apply()
+    /** auto | opencl | vulkan | cpu. auto = OpenCL on Snapdragon, Vulkan where the phone
+     *  advertises it (Mali, others), CPU otherwise; each falls back to the next on failure. */
+    var gpuMode: String
+        get() = p.getString("gpuMode", "auto") ?: "auto"
+        set(v) = p.edit().putString("gpuMode", v).apply()
 
     var enabled: Boolean
         get() = p.getBoolean("enabled", false)

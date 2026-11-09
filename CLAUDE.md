@@ -72,11 +72,13 @@ android-app/ (Kotlin, minSdk 26, arm64 only). rpc-server is packaged as
 lib/arm64-v8a/librpc-server.so and executed from nativeLibraryDir
 (useLegacyPackaging=true, extractNativeLibs=true). Build the binary with
 android-app/build-rpc-server.sh (NDK, static, GGML_OPENMP=OFF), then gradle.
-Two binaries: librpc-server.so (CPU) and librpc-server-cl.so (GGML_OPENCL with
+Three binaries: librpc-server.so (CPU), librpc-server-cl.so (GGML_OPENCL with
 Adreno kernels embedded, linked against the Khronos ICD loader as a stub; at
-runtime LD_LIBRARY_PATH=/vendor/lib64 so the phone's real driver loads). The
-service prefers the OpenCL one on phones with /vendor/lib64/libOpenCL.so and
-falls back to CPU after two early deaths.
+runtime LD_LIBRARY_PATH=/vendor/lib64 so the phone's real driver loads) and
+librpc-server-vk.so (GGML_VULKAN against the NDK's libvulkan + glslc; the
+shader generator is built for the host automatically when cross-compiling).
+The service tries a chain (auto: opencl if vendor OpenCL, vulkan if Android
+reports FEATURE_VULKAN_HARDWARE_LEVEL, then cpu), two attempts each.
 CI: .github/workflows/android.yml. The APK in releases/ is served by the head
 as /home-cluster-worker.apk. Keep the llama.cpp ref equal to the head's pin.
 

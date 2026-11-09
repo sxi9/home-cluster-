@@ -64,7 +64,7 @@ cp "$REPO"/worker.sh "$T/join/"; echo "K10token" > "$T/join/token"
 printf 'DASHBOARD_USER=admin\nDASHBOARD_PASS_HASH=%s\nSESSION_SECRET=abc123\n' "$(python3 "$REPO/head/clusterd.py" --hash testpass)" >> "$T/head.env"
 CLUSTER_ENV=$T/head.env python3 "$REPO/head/clusterd.py" & 
 CLUSTER_ENV=$T/head.env python3 "$REPO/agent/cluster-agent.py" &
-sleep 1.5
+for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$PORT_D/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 
 ok() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; exit 1; }
@@ -91,8 +91,11 @@ hb '{"name":"phone-a","role":"worker","link":"wifi","lan_ip":"127.0.0.1","agent_
 [[ $(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"name":"../x"}' "http://127.0.0.1:$PORT_D/api/heartbeat") == 400 ]] && ok "bad node name rejected" || fail "name validation"
 hb '{"name":"standby1","role":"worker","standby":true,"standby_ready":true,"link":"wired","lan_ip":"127.0.0.1","agent_port":1,"mem":{"total_mb":16000,"free_mb":9000},"gpu":{"kind":"cpu"},"rpc":{"port":50059,"listening":false,"mem_mb":8000}}'
 curl -fsS -X POST -H 'Content-Type: application/json' -d '{"name":"probe","role":"worker","lan_ip":"127.0.0.1","mem":{"total_mb":1,"free_mb":1},"rpc":{"port":1,"listening":false}}' "http://127.0.0.1:$PORT_D/api/heartbeat" | grep -q '"fallbacks": \["http://127.0.0.1:'"$PORT_D"'"\]' && ok "heartbeat reply lists the standby head as fallback" || fail "fallbacks"
-sleep 1
-n=$(curl -fsS "http://127.0.0.1:$PORT_D/api/nodes" | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["awake"]]))')
+# the head's own agent posts its first heartbeat on start; give it time on a loaded machine
+for _ in $(seq 1 20); do
+  n=$(curl -fsS "http://127.0.0.1:$PORT_D/api/nodes" | python3 -c 'import json,sys; print(len([x for x in json.load(sys.stdin) if x["awake"]]))')
+  [[ $n == 5 ]] && break; sleep 1
+done
 [[ $n == 5 ]] && ok "5 awake nodes (head agent + 4 fake nodes)" || fail "expected 5 awake nodes, got $n"
 
 # 3. plan: wired first, wifi only when needed

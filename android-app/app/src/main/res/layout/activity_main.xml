@@ -25,8 +25,17 @@
         <EditText android:id="@+id/reserveMb" android:inputType="number" android:text="2048"
             android:layout_width="match_parent" android:layout_height="wrap_content" />
 
-        <Switch android:id="@+id/useGpu" android:text="Use Adreno GPU (OpenCL)" android:checked="true"
-            android:layout_marginTop="8dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
+        <TextView android:text="GPU backend" android:layout_marginTop="12dp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <RadioGroup android:id="@+id/gpuMode" android:orientation="horizontal"
+            android:layout_width="match_parent" android:layout_height="wrap_content">
+            <RadioButton android:id="@+id/gpuAuto" android:text="Auto" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            <RadioButton android:id="@+id/gpuOpenCL" android:text="Adreno (OpenCL)" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            <RadioButton android:id="@+id/gpuVulkan" android:text="Vulkan" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+            <RadioButton android:id="@+id/gpuCpu" android:text="CPU" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        </RadioGroup>
+        <TextView android:id="@+id/gpuHint" android:text="" android:textSize="12sp"
+            android:layout_width="wrap_content" android:layout_height="wrap_content" />
         <Switch android:id="@+id/autostart" android:text="Start at boot" android:checked="true"
             android:layout_marginTop="8dp" android:layout_width="match_parent" android:layout_height="wrap_content" />
 

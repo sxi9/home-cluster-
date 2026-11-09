@@ -38,7 +38,8 @@ Tick these off in order. Each section is independent once the head is up.
 - [ ] Enter the head URL, Start; status shows `rpc-server: up` and `head: http://...` with a recent heartbeat
 - [ ] Tap "Allow running in background", accept; on Xiaomi/Huawei/OnePlus also lock the app in recents
 - [ ] Rooted: status says `root: yes`; grant the su prompt once
-- [ ] Snapdragon: status says `backend: Adreno OpenCL`; the dashboard card shows `opencl`; `cluster bench` once with the GPU switch on, once off
+- [ ] Snapdragon: status says `backend: Adreno OpenCL`; the dashboard card shows `opencl`; `cluster bench` with Auto and with CPU
+- [ ] Mali phone: status says `backend: Vulkan`; the dashboard card shows `vulkan`; `cluster bench` with Auto and with CPU
 - [ ] On the head: `cluster nodes` lists the phone with rpc `up`; dashboard card shows `app: android-apk`
 - [ ] Screen off for 10 minutes: the phone stays awake on the dashboard
 - [ ] Reboot the phone: it comes back within a minute (Start at boot switch)
@@ -106,6 +107,8 @@ Tick these off in order. Each section is independent once the head is up.
 - [x] Dashboard login, `cluster tune --auto`, standby head with automatic failover (untested on hardware)
 - [x] Android app (root and non-root) with rpc-server inside; APK built, not yet installed on a phone
 - [x] Android app: Adreno OpenCL build (second binary in the APK, auto-selected, CPU fallback)
+- [x] Android app: Vulkan build for Mali phones, auto-selected with fallback chain
 - [ ] Android app: measured on a Snapdragon phone, GPU vs CPU with `cluster bench`
+- [ ] Android app: measured on a Mali phone (Exynos/Tensor/MediaTek), Vulkan vs CPU
 - [ ] Tested worker.ps1 on the Windows laptop
 - [ ] iOS worker app

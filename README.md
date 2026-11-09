@@ -70,9 +70,10 @@ curl -fsSL http://HEAD-IP:8787/worker.sh | sudo bash
 **3. Each Android phone, root or not**, with the app: open
 `http://HEAD-IP:8787/home-cluster-worker.apk` on the phone, install, enter the
 head URL, tap Start. Root is optional; with it the app also protects
-`rpc-server` from Android's memory killer. On Snapdragon phones it uses the
-Adreno GPU through OpenCL, elsewhere the CPU. See
-[docs/android-app.md](docs/android-app.md).
+`rpc-server` from Android's memory killer. Snapdragon phones use the Adreno
+GPU through OpenCL, Mali phones (Exynos, Tensor, MediaTek) use Vulkan, and
+anything else uses the CPU, each falling back to the next if a driver
+misbehaves. See [docs/android-app.md](docs/android-app.md).
 
 Or, for the Adreno GPU path on a rooted Snapdragon phone, Termux (install
 Termux, Termux:Boot and optionally Tailscale from F-Droid first):
@@ -224,7 +225,7 @@ default build is shared libraries (the scripts now build static). See
 | `worker.sh` | Ubuntu workers | packages, Tailscale, NFS mount, rpc-server build + service, agent, k3s agent |
 | `android.sh` | Termux phones | rpc-server build (Adreno OpenCL or CPU), termux-services, boot start, sshd, root tweaks |
 | `android-app/` | any arm64 Android phone | Kotlin app with rpc-server inside; root optional; built by CI, served by the head |
-| `releases/home-cluster-worker.apk` | phones | the current app build (llama.cpp b12098, CPU + Adreno OpenCL) |
+| `releases/home-cluster-worker.apk` | phones | the current app build (llama.cpp b12098, CPU + Adreno OpenCL + Vulkan) |
 | `worker.ps1` | Windows PCs | native worker: prebuilt llama.cpp release, startup tasks, heartbeat agent; model pool only |
 | `k8s/open-webui.yaml` | head (k3s) | Open WebUI deployment applied by `cluster ui` |
 | `bin/cluster` | head | `nodes`, `plan`, `run`, `status`, `stop`, `logs`, `models`, `bench`, `tune [--auto]`, `top`, `kill`, `ui`, `exec`, `restart`, `ssh`, `share`, `password`, `failover` |

@@ -11,9 +11,10 @@ android {
         applicationId = "io.homecluster.worker"
         minSdk = 26           // Android 8.0+
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2"
-        ndk { abiFilters += "arm64-v8a" }
+        versionCode = 3
+        versionName = "0.3"
+        // phones are arm64; `-PwithX86` adds x86_64 so the app also runs in the emulator (screenshots, tests)
+        ndk { abiFilters += listOf("arm64-v8a") + (if (project.hasProperty("withX86")) listOf("x86_64") else listOf()) }
     }
     // rpc-server ships as "librpc-server.so" and is executed from the app's native
     // library directory: the only place Android lets an app run a binary from.

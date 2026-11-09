@@ -12,7 +12,8 @@ runs it as a foreground service, with the same agent the other devices run.
 | survives memory pressure | mostly: ask for the battery exemption in the app | yes: `oom_score_adj -1000` on rpc-server |
 | starts at boot | yes (switch in the app) | yes |
 | Wi‑Fi stays on in sleep | depends on the phone's settings | forced on |
-| GPU (Adreno OpenCL) | yes, when the phone has `/vendor/lib64/libOpenCL.so` (Snapdragon) | yes |
+| GPU: Adreno OpenCL | yes, when the phone has `/vendor/lib64/libOpenCL.so` (Snapdragon) | yes |
+| GPU: Vulkan (Mali on Exynos/Tensor/MediaTek, others) | yes, when Android advertises Vulkan hardware support | yes |
 | k3s | no | no |
 
 ## Install
@@ -29,13 +30,22 @@ runs it as a foreground service, with the same agent the other devices run.
 4. On the head: `cluster nodes` lists the phone; the dashboard card shows
    `app: android-apk`.
 
-## Adreno GPU
+## GPU backends
 
-The APK carries two `rpc-server` binaries: a CPU one and one built with
-llama.cpp's OpenCL backend and the Adreno-tuned kernels embedded. On start the
-app picks the OpenCL binary when the "Use Adreno GPU" switch is on and the
-phone has a vendor OpenCL driver (`/vendor/lib64/libOpenCL.so`, present on
-Snapdragon phones). The driver sits outside the app's linker namespace, so
+The APK carries three `rpc-server` binaries: CPU, OpenCL (Adreno-tuned
+kernels embedded) and Vulkan. The **GPU backend** choice in the app is
+`Auto` by default: OpenCL when the phone has a vendor OpenCL driver
+(`/vendor/lib64/libOpenCL.so`, present on Snapdragon phones), otherwise
+Vulkan when Android reports Vulkan hardware support (Mali GPUs in Exynos,
+Tensor and MediaTek phones, and most others), otherwise CPU. Each backend
+gets two attempts; if it keeps dying at start the app moves to the next one
+in the chain and says so on the status screen. You can also pin a backend.
+
+The Vulkan binary uses Android's own `/system/lib64/libvulkan.so`, a public
+library, so no loader tricks are needed. Mali support in llama.cpp's Vulkan
+backend is newer and less tuned than Adreno OpenCL: expect it to work on
+Mali-G7x and newer, and to be slower than the CPU on some phones. Measure
+with `cluster bench`. For the OpenCL binary: The driver sits outside the app's linker namespace, so
 the binary is launched with `LD_LIBRARY_PATH` pointing at the vendor
 libraries, and compiled kernels are cached in the app's cache directory so
 later starts are fast. If the OpenCL binary dies twice within its first 15
@@ -59,7 +69,7 @@ artifact. Run the workflow by hand with a `llama_ref` input to match the commit
 the head pinned. Locally:
 
 ```bash
-ANDROID_NDK=/path/to/ndk android-app/build-rpc-server.sh b12098   # rpc-server → librpc-server.so
+ANDROID_NDK=/path/to/ndk android-app/build-rpc-server.sh b12098 all   # CPU, OpenCL and Vulkan rpc-server binaries
 cd android-app && gradle assembleDebug                              # app/build/outputs/apk/debug/app-debug.apk
 ```
 
@@ -86,8 +96,9 @@ protocol may not match.
 
 ## Limits
 
-- Only Qualcomm's OpenCL driver is targeted. Mali (Samsung Exynos, Google
-  Tensor) and other GPUs fall back to CPU.
+- Vulkan on phones depends on the OEM's driver quality; a crash at start is
+  caught by the fallback chain, a crash mid-run restarts `rpc-server` (the
+  current model run on the head will have to be started again).
 - No process list for other apps (Android 8+ hides it); the dashboard shows
   memory, CPU, temperature, battery and storage instead.
 - Phones cannot resolve `cluster-head.local`; always use the head's IP.
