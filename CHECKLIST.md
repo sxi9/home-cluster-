@@ -108,6 +108,7 @@ Tick these off in order. Each section is independent once the head is up.
 - [x] Android app (root and non-root) with rpc-server inside; APK built, not yet installed on a phone
 - [x] Android app: Adreno OpenCL build (second binary in the APK, auto-selected, CPU fallback)
 - [x] Android app: Vulkan build for Mali phones, auto-selected with fallback chain
+- [x] Android app run in an emulator: rpc-server up, heartbeats reach the head, dashboard shows the phone
 - [ ] Android app: measured on a Snapdragon phone, GPU vs CPU with `cluster bench`
 - [ ] Android app: measured on a Mali phone (Exynos/Tensor/MediaTek), Vulkan vs CPU
 - [ ] Tested worker.ps1 on the Windows laptop

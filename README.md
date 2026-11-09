@@ -225,7 +225,13 @@ it was built from.
 
 | ![setup](docs/screenshots/app-setup.png) | ![running](docs/screenshots/app-running.png) | ![notification](docs/screenshots/app-notification.png) |
 |---|---|---|
-| setup screen | running: rpc-server up, backend, head, root state | the persistent notification with its Stop action |
+| setup: head URL, name, RAM to keep, GPU backend | running: rpc-server up, offered RAM, head heartbeat, llama.cpp commit, root state | the persistent notification with its Stop action |
+
+And the same emulator as the head's dashboard shows it, from the app's own
+heartbeats (RAM, offered memory, rpc state, battery, temperature, CPU,
+storage):
+
+<img src="docs/screenshots/dashboard-emulator-card.png" width="320" alt="emulator phone card on the dashboard">
 
 ## What is in the repo
 
