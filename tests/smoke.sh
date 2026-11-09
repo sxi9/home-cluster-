@@ -70,7 +70,7 @@ ok() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; exit 1; }
 
 # 1. join files + templating + traversal
-curl -fsS "http://127.0.0.1:$PORT_D/worker.sh" | grep -q "^JOIN_URL_DEFAULT=\"http://127.0.0.1:$PORT_D\"" && ok "served worker.sh carries the head URL" || fail "templating"
+curl -fsS "http://127.0.0.1:$PORT_D/worker.sh" | grep "^JOIN_URL_DEFAULT=\"http://127.0.0.1:$PORT_D\"" >/dev/null && ok "served worker.sh carries the head URL" || fail "templating"
 [[ $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_D/../head.env") == 404 ]] && ok "no path traversal" || fail "traversal"
 [[ $(curl -fsS "http://127.0.0.1:$PORT_D/token") == K10token ]] && ok "token served" || fail "token"
 

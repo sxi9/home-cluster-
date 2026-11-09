@@ -62,6 +62,7 @@ class WorkerService : Service() {
 
     /** Android's own Vulkan loader + a driver the OEM registered (Mali, Adreno, PowerVR...). */
     private fun hasVulkan(): Boolean =
+        Build.VERSION.SDK_INT >= 29 &&   // the Vulkan binary links Vulkan 1.1 entry points, exported from Android 10
         File("/system/lib64/libvulkan.so").exists() && packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL, 0)
 
     private fun gpuLabel(kind: String): String {

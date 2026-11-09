@@ -86,10 +86,14 @@ if [[ $WHAT == vulkan || $WHAT == all ]]; then
   fi
   # ggml-vulkan is written against Vulkan-Hpp (vulkan/vulkan.hpp), which the NDK does not ship
   [[ -d $DEPS/Vulkan-Headers/.git ]] || git clone --quiet --depth 1 https://github.com/KhronosGroup/Vulkan-Headers "$DEPS/Vulkan-Headers"
+  # Android 10 (API 29) is the first libvulkan stub that exports the Vulkan 1.1 entry points
+  # ggml-vulkan links against (vkGetPhysicalDeviceFeatures2); the app skips this binary below 29.
   build_one "$SRC/build-android-vk" librpc-server-vk.so \
+    -DANDROID_PLATFORM=android-29 \
     -DGGML_VULKAN=ON -DCMAKE_PREFIX_PATH="$DEPS/spirv" -DSPIRV-Headers_DIR="$DEPS/spirv/share/cmake/SPIRV-Headers" \
     -DVulkan_INCLUDE_DIR="$DEPS/Vulkan-Headers/include" \
-    -DVulkan_LIBRARY="$SYSROOT/usr/lib/aarch64-linux-android/26/libvulkan.so" \
+    -DCMAKE_CXX_FLAGS="-march=armv8.2-a+fp16+dotprod -I$DEPS/spirv/include" \
+    -DVulkan_LIBRARY="$SYSROOT/usr/lib/aarch64-linux-android/29/libvulkan.so" \
     -DVulkan_GLSLC_EXECUTABLE="$GLSLC"
 fi
 echo "built from llama.cpp $(cat "$HERE/app/src/main/assets/llama_ref.txt")"
