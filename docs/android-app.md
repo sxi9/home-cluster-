@@ -73,9 +73,11 @@ ANDROID_NDK=/path/to/ndk android-app/build-rpc-server.sh b12098 all   # CPU, Ope
 cd android-app && gradle assembleDebug                              # app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The build in this repo's `releases/` was made from llama.cpp `b12098`; the
-head must run the same commit (`head.sh --llama-ref b12098`) or the RPC
-protocol may not match.
+The build in this repo's `releases/` was made from llama.cpp `b12098` and
+contains all three binaries (CPU 1.6 MB, OpenCL 5.5 MB, Vulkan 22 MB with its
+SPIR-V shaders embedded; 15 MB as an APK). The head must run the same commit
+(`head.sh --llama-ref b12098`) or the RPC protocol may not match. The Vulkan
+binary needs Android 10 or newer; the app skips it on older phones.
 
 ## How it works
 
